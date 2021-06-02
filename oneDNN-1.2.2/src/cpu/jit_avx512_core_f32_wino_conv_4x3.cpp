@@ -69,7 +69,7 @@ void _jit_avx512_core_f32_wino_conv_4x3_t<is_fwd>::weight_transform_data(
 template <bool is_fwd>
 void _jit_avx512_core_f32_wino_conv_4x3_t<is_fwd>::output_transform_data(
         int image, const jit_conv_winograd_conf_t &jcp, const post_ops_t &p_ops,
-        float *toutp, float *pout_b, float *bias) const {
+        float *toutp, int MnbBlock, int Mblock, float *pout_b, float *bias) const {
 
     float G[] = {0.625f, 1.5f, 0.390625f, 2.25f, 0.244140625f, 3.375f};
     float Ow[alpha][alpha][simd_w];
@@ -77,7 +77,8 @@ void _jit_avx512_core_f32_wino_conv_4x3_t<is_fwd>::output_transform_data(
     float T[tile_size][alpha][simd_w];
 
     auto p = jit_wino_transform_call_s();
-    p.src = toutp;
+
+    //p.src = toutp;//need adjustment
     p.dst = pout_b;
     p.G = G;
     p.M = O;
@@ -86,11 +87,15 @@ void _jit_avx512_core_f32_wino_conv_4x3_t<is_fwd>::output_transform_data(
     p.bias = bias;
 
     int tile_base_index = image * jcp.itiles * jcp.jtiles;
+    int tile_block
+            = (tile_base_index / jcp.tile_block_ur) / jcp.nb_tile_block_ur;
     int tile_block_ur = tile_base_index % jcp.tile_block_ur;
     int nb_tile_block_ur
             = (tile_base_index / jcp.tile_block_ur) % jcp.nb_tile_block_ur;
-    int tile_block
-            = (tile_base_index / jcp.tile_block_ur) / jcp.nb_tile_block_ur;
+if (jcp.dimNblockRemain != 0 && tile_block == jcp.dimN_nb_block-1) {
+    tile_block_ur = (tile_base_index - tile_block*jcp.tile_block_ur*jcp.nb_tile_block_ur) % jcp.dimNregBlockRemain;
+    nb_tile_block_ur = (tile_base_index - tile_block*jcp.tile_block_ur*jcp.nb_tile_block_ur) / jcp.dimNregBlockRemain;
+}
 
     for (int tj = 0; tj < jcp.jtiles; tj++) {
         for (int ti = 0; ti < jcp.itiles; ti++) {
@@ -100,7 +105,24 @@ void _jit_avx512_core_f32_wino_conv_4x3_t<is_fwd>::output_transform_data(
             p.tile_block = tile_block;
             p.tj = tj;
             p.ti = ti;
+///my : new cache block method
+if (jcp.dimNblockRemain != 0 && tile_block == jcp.dimN_nb_block-1) {
+        p.src = toutp + (MnbBlock*alpha*alpha*jcp.dimNblockRemain*jcp.dimM_block * jcp.dimM_reg_block + Mblock)
+                *jcp.dimNregBlockRemain*jcp.dimM_simd_block;
+        kernel_->output_transform_data_foot_ker(&p);
 
+        tile_block_ur++;
+        if (tile_block_ur >= jcp.dimNregBlockRemain) {
+            tile_block_ur = 0;
+            nb_tile_block_ur++;
+        }
+        if (nb_tile_block_ur >= jcp.dimNblockRemain) {
+            nb_tile_block_ur = 0;
+            tile_block++;
+        }
+} else {
+        p.src = toutp + (MnbBlock*alpha*alpha*jcp.dimN_block*jcp.dimM_block * jcp.dimM_reg_block + Mblock)
+                *jcp.dimN_reg_block*jcp.dimM_simd_block;
             kernel_->output_transform_data_ker(&p);
 
             tile_block_ur++;
@@ -112,6 +134,7 @@ void _jit_avx512_core_f32_wino_conv_4x3_t<is_fwd>::output_transform_data(
                 nb_tile_block_ur = 0;
                 tile_block++;
             }
+}
         }
     }
 }
@@ -167,9 +190,59 @@ void _jit_avx512_core_f32_wino_conv_4x3_t<
 }
 
 template <bool is_fwd>
+void _jit_avx512_core_f32_wino_conv_4x3_t<
+        is_fwd>::output_transform_tileblock_data_tail(int tile_block,
+        const jit_conv_winograd_conf_t &jcp, const post_ops_t &p_ops,
+        float *toutp, float *outp, float *bias) const {
+
+    float G[] = {0.625f, 1.5f, 0.390625f, 2.25f, 0.244140625f, 3.375f};
+    float Ow[alpha][alpha][simd_w];
+    float O[tile_size][tile_size][simd_w];
+    float T[tile_size][alpha][simd_w];
+
+    auto p = jit_wino_transform_call_s();
+    p.src = toutp;
+    p.dst = outp;
+    p.G = G;
+    p.M = O;
+    p.Mw = Ow;
+    p.T = T;
+    p.bias = bias;
+
+    int outw = is_fwd ? jcp.ow : jcp.iw;
+    int outh = is_fwd ? jcp.oh : jcp.ih;
+
+    int tile_index = tile_block * jcp.nb_tile_block_ur * jcp.tile_block_ur;
+
+    for (int nb_tile_block_ur = 0; nb_tile_block_ur < jcp.dimNblockRemain;
+            nb_tile_block_ur++) {
+
+        for (int tile_block_ur = 0; tile_block_ur < jcp.dimNregBlockRemain;
+                tile_block_ur++) {
+            int img = tile_index / (jcp.jtiles * jcp.itiles);
+            int ti = tile_index % jcp.itiles;
+            int tj = (tile_index / jcp.itiles) % jcp.jtiles;
+
+            p.tile_block_ur = tile_block_ur;
+            p.nb_tile_block_ur = nb_tile_block_ur;
+            p.tile_block = tile_block;
+            p.tj = tj;
+            p.ti = ti;
+            p.dst = outp
+                    + img * (jcp.dimM / jcp.dimM_simd_block) * outh * outw
+                            * jcp.dimM_simd_block;
+
+            kernel_->output_transform_data_tail_ker(&p);
+
+            tile_index++;
+        }
+    }
+}
+
+template <bool is_fwd>
 void _jit_avx512_core_f32_wino_conv_4x3_t<is_fwd>::input_transform_data(
         int image, const jit_conv_winograd_conf_t &jcp, float *inp,
-        float *tinp) const {
+        float *tinp, int KnbBlock, int Kblock) const {
     float G[] = {-2.25f, -0.390625f, 0.87890625f, -2.640625f, 0.625f, -0.625f,
             1.5f, -1.5f, -2.640625f};
 
@@ -180,18 +253,22 @@ void _jit_avx512_core_f32_wino_conv_4x3_t<is_fwd>::input_transform_data(
     auto p = jit_wino_transform_call_s();
 
     p.src = inp;
-    p.dst = tinp;
+    //p.dst = tinp;//need adjustment
     p.G = G;
     p.M = I;
     p.Mw = Iw;
     p.T = T;
 
     int tile_base_index = image * jcp.itiles * jcp.jtiles;
+    int tile_block
+            = (tile_base_index / jcp.tile_block_ur) / jcp.nb_tile_block_ur;
     int tile_block_ur = tile_base_index % jcp.tile_block_ur;
     int nb_tile_block_ur
             = (tile_base_index / jcp.tile_block_ur) % jcp.nb_tile_block_ur;
-    int tile_block
-            = (tile_base_index / jcp.tile_block_ur) / jcp.nb_tile_block_ur;
+if (jcp.dimNblockRemain != 0 && tile_block == jcp.dimN_nb_block-1) {
+    tile_block_ur = (tile_base_index - tile_block*jcp.tile_block_ur*jcp.nb_tile_block_ur) % jcp.dimNregBlockRemain;
+    nb_tile_block_ur = (tile_base_index - tile_block*jcp.tile_block_ur*jcp.nb_tile_block_ur) / jcp.dimNregBlockRemain;
+}
 
     for (int tj = 0; tj < jcp.jtiles; tj++) {
         for (int ti = 0; ti < jcp.itiles; ti++) {
@@ -201,7 +278,22 @@ void _jit_avx512_core_f32_wino_conv_4x3_t<is_fwd>::input_transform_data(
             p.tile_block = tile_block;
             p.tj = tj;
             p.ti = ti;
+///my : new cache block method
+if (jcp.dimNblockRemain != 0 && tile_block == jcp.dimN_nb_block-1) {
+        p.dst = tinp + (KnbBlock*jcp.dimK_block+Kblock)*alpha*alpha*jcp.dimNblockRemain*jcp.dimNregBlockRemain*jcp.dimK_reg_block;
+        kernel_->input_transform_data_foot_ker(&p);
 
+        tile_block_ur++;
+        if (tile_block_ur >= jcp.dimNregBlockRemain) {
+            tile_block_ur = 0;
+            nb_tile_block_ur++;
+        }
+        if (nb_tile_block_ur >= jcp.dimNblockRemain) {
+            nb_tile_block_ur = 0;
+            tile_block++;
+        }
+} else {
+        p.dst = tinp + (KnbBlock*jcp.dimK_block+Kblock)*alpha*alpha*jcp.dimN_block*jcp.dimN_reg_block*jcp.dimK_reg_block;
             kernel_->input_transform_data_ker(&p);
 
             tile_block_ur++;
@@ -213,6 +305,7 @@ void _jit_avx512_core_f32_wino_conv_4x3_t<is_fwd>::input_transform_data(
                 nb_tile_block_ur = 0;
                 tile_block++;
             }
+}
         }
     }
 }
@@ -270,6 +363,60 @@ void _jit_avx512_core_f32_wino_conv_4x3_t<
     }
 }
 
+///my : new register block method
+template <bool is_fwd>
+void _jit_avx512_core_f32_wino_conv_4x3_t<
+        is_fwd>::input_transform_tileblock_data_tail(int tile_block,
+        const jit_conv_winograd_conf_t &jcp, float *inp, float *tinp) const {
+    float G[] = {-2.25f, -0.390625f, 0.87890625f, -2.640625f, 0.625f, -0.625f,
+            1.5f, -1.5f, -2.640625f};
+    float Iw[alpha][alpha][simd_w];
+    float I[alpha][alpha][simd_w];
+    float T[alpha][alpha][simd_w];
+
+    const int inph = is_fwd ? jcp.ih : jcp.oh;
+    const int inpw = is_fwd ? jcp.iw : jcp.ow;
+
+    array_offset_calculator<float, 5> input(
+            inp, jcp.mb, jcp.dimK / simd_w, inph, inpw, simd_w);
+    array_offset_calculator<float, 7> output(tinp, alpha, alpha, jcp.dimNblockRemain,
+            jcp.dimK_nb_block, jcp.dimK_block, jcp.dimNregBlockRemain,
+            jcp.dimK_reg_block);
+
+    auto p = jit_wino_transform_call_s();
+
+    p.dst = tinp;
+    p.G = G;
+    p.M = I;
+    p.Mw = Iw;
+    p.T = T;
+
+    int tile_index = tile_block * jcp.nb_tile_block_ur * jcp.tile_block_ur;
+
+    for (int nb_tile_block_ur = 0; nb_tile_block_ur < jcp.dimNblockRemain;
+            nb_tile_block_ur++) {
+
+        for (int tile_block_ur = 0; tile_block_ur < jcp.dimNregBlockRemain;
+                tile_block_ur++) {
+
+            int img = tile_index / (jcp.jtiles * jcp.itiles);
+            int ti = tile_index % jcp.itiles;
+            int tj = (tile_index / jcp.itiles) % jcp.jtiles;
+            float *pinp_b = &(input(img, 0, 0, 0, 0));
+
+            p.src = pinp_b;
+            p.tile_block_ur = tile_block_ur;
+            p.nb_tile_block_ur = nb_tile_block_ur;
+            p.tj = tj;
+            p.ti = ti;
+
+            kernel_->input_transform_data_tail_ker(&p);
+
+            tile_index++;
+        }
+    }
+}
+
 template <bool is_fwd>
 void _jit_avx512_core_f32_wino_conv_4x3_t<is_fwd>::_execute_data_W_S_G_D(
         float *inp_ptr, float *out_ptr, float *wei_ptr, float *bias_ptr,
@@ -311,11 +458,17 @@ void _jit_avx512_core_f32_wino_conv_4x3_t<is_fwd>::_execute_data_W_S_G_D(
     array_offset_calculator<float, 8> U(wino_wei, jcp.dimM_nb_block, alpha,
             alpha, jcp.dimK_nb_block, jcp.dimM_block * jcp.dimM_reg_block,
             jcp.dimK_block, jcp.dimK_reg_block, jcp.dimM_simd_block);
+//     array_offset_calculator<float, 8> V(is_fwd
+//                     ? scratchpad.template get<float>(key_wino_V)
+//                     : scratchpad.template get<float>(key_wino_M),
+//             jcp.dimN_nb_block, alpha, alpha, jcp.dimN_block, jcp.dimK_nb_block,
+//             jcp.dimK_block, jcp.dimN_reg_block, jcp.dimK_reg_block);
+    ///my : new data layout for input buffer
     array_offset_calculator<float, 8> V(is_fwd
                     ? scratchpad.template get<float>(key_wino_V)
                     : scratchpad.template get<float>(key_wino_M),
-            jcp.dimN_nb_block, alpha, alpha, jcp.dimN_block, jcp.dimK_nb_block,
-            jcp.dimK_block, jcp.dimN_reg_block, jcp.dimK_reg_block);
+            jcp.dimN_nb_block, jcp.dimK_nb_block, jcp.dimK_block, alpha, alpha, 
+            jcp.dimN_block, jcp.dimN_reg_block, jcp.dimK_reg_block);
 
     const bool wants_padded_bias
             = jcp.with_bias && jcp.oc_without_padding != jcp.oc;
@@ -324,16 +477,16 @@ void _jit_avx512_core_f32_wino_conv_4x3_t<is_fwd>::_execute_data_W_S_G_D(
         for (int oc = 0; oc < jcp.oc_without_padding % jcp.oc_simd_block; ++oc)
             last_slice_bias[oc] = bias(jcp.dimM / jcp.dimM_simd_block - 1, oc);
     }
-
 auto t0 = high_resolution_clock::now();
     parallel_nd(jcp.mb, jcp.dimK_nb_block, jcp.dimK_block,
             [&](int img, int K_blk1, int K_blk2) {
                 input_transform_data(img, jcp,
                         &(input(img, K_blk1 * jcp.dimK_block + K_blk2, 0, 0,
                                 0)),
-                        &(V(0, 0, 0, 0, K_blk1, K_blk2, 0, 0)));
+                        // &(V(0, 0, 0, 0, K_blk1, K_blk2, 0, 0)));
+                        // &(V(0, K_blk1, K_blk2, 0, 0, 0, 0, 0)));///my : new data layout for input buffer
+                        &(V(0, 0, 0, 0, 0, 0, 0, 0)), K_blk1, K_blk2);///my : new cacheB ; diff last NnbBlock layout
             });
-
 auto t1 = high_resolution_clock::now();
     if (jcp.prop_kind != prop_kind::forward_inference) {
         parallel_nd(jcp.nb_oc, jcp.nb_ic, (jcp.oc_block * jcp.oc_reg_block),
@@ -351,21 +504,33 @@ auto t1 = high_resolution_clock::now();
                             U_base_ptr);
                 });
     }
-
 auto t2 = high_resolution_clock::now();
     parallel_nd(jcp.dimN_nb_block, alpha, alpha, jcp.dimM_nb_block,
             [&](int N_blk1, int oj, int oi, int M_blk1) {
+if (jcp.dimNblockRemain != 0 && N_blk1 == jcp.dimN_nb_block-1) { ///my : new cache block method
+                for (int K_blk1 = 0; K_blk1 < jcp.dimK_nb_block; K_blk1++)
+                    for (int N_blk2 = 0; N_blk2 < jcp.dimNblockRemain; N_blk2++)
+                        kernel_->gemm_loop_foot_ker(
+                                (float *)&(M(N_blk1, 0, 0, 0, 0, 0, 0, 0))+(((M_blk1*alpha+oj)*alpha+oi)*jcp.dimNblockRemain+N_blk2)
+                                        *jcp.dimM_block * jcp.dimM_reg_block*jcp.dimNregBlockRemain*jcp.dimM_simd_block,
+                                (const float *)&(
+                                        U(M_blk1, oj, oi, K_blk1, 0, 0, 0, 0)),
+                                (const float *)&(V(N_blk1, 0, 0, 0, 0, 0, 0, 0))+(((K_blk1*jcp.dimK_block*alpha+oj)*alpha+oi)
+                                        *jcp.dimNblockRemain+N_blk2)*jcp.dimNregBlockRemain*jcp.dimK_reg_block,
+                                K_blk1);
+} else {
                 for (int K_blk1 = 0; K_blk1 < jcp.dimK_nb_block; K_blk1++)
                     for (int N_blk2 = 0; N_blk2 < jcp.dimN_block; N_blk2++)
                         kernel_->gemm_loop_ker((float *)&(M(N_blk1, M_blk1, oj,
                                                        oi, N_blk2, 0, 0, 0)),
                                 (const float *)&(
                                         U(M_blk1, oj, oi, K_blk1, 0, 0, 0, 0)),
-                                (const float *)&(V(N_blk1, oj, oi, N_blk2,
-                                        K_blk1, 0, 0, 0)),
+                                // (const float *)&(V(N_blk1, oj, oi, N_blk2,
+                                //         K_blk1, 0, 0, 0)),
+                                (const float *)&(V(N_blk1, K_blk1, 0, oj, oi, N_blk2, 0, 0)),///my : new data layout for input buffer
                                 K_blk1);
+}
             });
-
 auto t3 = high_resolution_clock::now();
     parallel_nd(jcp.mb, jcp.dimM_nb_block,
             (jcp.dimM_block * jcp.dimM_reg_block),
@@ -378,7 +543,8 @@ auto t3 = high_resolution_clock::now();
                         ? last_slice_bias
                         : &bias(M_blk, 0);
                 output_transform_data(img, jcp, p_ops,
-                        &(M(0, M_blk1, 0, 0, 0, M_blk2, 0, 0)),
+                        // &(M(0, M_blk1, 0, 0, 0, M_blk2, 0, 0)),
+                        &(M(0, 0, 0, 0, 0, 0, 0, 0)), M_blk1, M_blk2,///my : new cacheB ; diff last NnbBlock layout
                         &(output(img, M_blk, 0, 0, 0)), bias_ptr);
             });
 auto t4 = high_resolution_clock::now();
@@ -428,6 +594,17 @@ void _jit_avx512_core_f32_wino_conv_4x3_t<is_fwd>::_execute_data_W_SGD(
                     : scratchpad.template get<float>(key_wino_M),
             0, alpha, alpha, jcp.dimN_block, jcp.dimK_nb_block, jcp.dimK_block,
             jcp.dimN_reg_block, jcp.dimK_reg_block);
+///my : new register block method
+// array_offset_calculator<float, 8> remainM(is_fwd
+//                 ? scratchpad.template get<float>(key_wino_M)
+//                 : scratchpad.template get<float>(key_wino_V),
+//         0, jcp.dimM_nb_block, alpha, alpha, jcp.dimNblockRemain,
+//         jcp.dimM_block * jcp.dimM_reg_block, jcp.dimNregBlockRemain, jcp.dimM_simd_block);
+// array_offset_calculator<float, 8> remainV(is_fwd
+//                 ? scratchpad.template get<float>(key_wino_V)
+//                 : scratchpad.template get<float>(key_wino_M),
+//         0, alpha, alpha, jcp.dimNblockRemain, jcp.dimK_nb_block, jcp.dimK_block,
+//         jcp.dimNregBlockRemain, jcp.dimK_reg_block);
 
     const bool wants_padded_bias
             = jcp.with_bias && jcp.oc_without_padding != jcp.oc;
@@ -457,7 +634,51 @@ void _jit_avx512_core_f32_wino_conv_4x3_t<is_fwd>::_execute_data_W_SGD(
 
     parallel_nd(jcp.tile_block, [&](int tile_block) {
         int ithr = dnnl_get_thread_num();
+///my : new register block method
+if (jcp.dimNregBlockRemain != 0 && tile_block == jcp.tile_block - 1) {
+        for (int K_blk1 = 0; K_blk1 < jcp.dimK_nb_block; K_blk1++) {
+            for (int K_blk2 = 0; K_blk2 < jcp.dimK_block; K_blk2++) {
+                input_transform_tileblock_data_tail(tile_block, jcp,
+                        &(input(0, K_blk1 * jcp.dimK_block + K_blk2, 0, 0, 0)),
+                        // &(remainV(ithr, 0, 0, 0, K_blk1, K_blk2, 0, 0)));///offset error
+                        &(V(ithr, 0, 0, 0, 0, 0, 0, 0))+(K_blk1*jcp.dimK_block+K_blk2)*jcp.dimNregBlockRemain*jcp.dimK_reg_block);
+            }
+        }
+        for (int oj = 0; oj < alpha; oj++) {
+            for (int oi = 0; oi < alpha; oi++) {
+                for_(int M_blk1 = 0; M_blk1 < jcp.dimM_nb_block; M_blk1++)
+                for_(int K_blk1 = 0; K_blk1 < jcp.dimK_nb_block; K_blk1++)
+                for (int N_blk = 0; N_blk < jcp.dimNblockRemain; N_blk++)
+                    kernel_->gemm_loop_tail_ker(
+                            //(float *)&(remainM(ithr, M_blk1, oj, oi, N_blk, 0, 0, 0)),///offset incorrect
+                            (float *)&(M(ithr, 0, 0, 0, 0, 0, 0, 0))+(((M_blk1*alpha+oj)*alpha+oi)*jcp.dimNblockRemain+N_blk)
+                                    *jcp.dimM_block * jcp.dimM_reg_block*jcp.dimNregBlockRemain*jcp.dimM_simd_block,
+                            (const float *)&(U(M_blk1, oj, oi, K_blk1, 0, 0, 0, 0)),
+                            //(const float *)&(remainV(ithr, oj, oi, N_blk, K_blk1, 0, 0, 0)),///offset incorrect
+                            (const float *)&(V(ithr, 0, 0, 0, 0, 0, 0, 0))+(((oj*alpha+oi)*jcp.dimNblockRemain+N_blk)
+                                    *jcp.dimK_nb_block+K_blk1)*jcp.dimK_block*jcp.dimNregBlockRemain*jcp.dimK_reg_block,
+                            K_blk1);
+            }
+        }
+        for (int M_blk1 = 0; M_blk1 < jcp.dimM_nb_block; M_blk1++) {
+            for (int M_blk2 = 0; M_blk2 < jcp.dimM_block * jcp.dimM_reg_block;
+                    M_blk2++) {
+                const int M_blk
+                        = M_blk1 * jcp.dimM_block * jcp.dimM_reg_block + M_blk2;
 
+                float *bias_ptr = wants_padded_bias
+                                && M_blk == jcp.dimM / jcp.dimM_simd_block - 1
+                        ? last_slice_bias
+                        : &bias(M_blk, 0);
+
+                output_transform_tileblock_data_tail(tile_block, jcp, p_ops,
+                        //&(remainM(ithr, M_blk1, 0, 0, 0, M_blk2, 0, 0)),///offset incorrect
+                        &(M(ithr, 0, 0, 0, 0, 0, 0, 0))+(M_blk1*alpha*alpha*jcp.dimNblockRemain
+                        *jcp.dimM_block * jcp.dimM_reg_block+M_blk2)*jcp.dimNregBlockRemain*jcp.dimM_simd_block,
+                        &(output(0, M_blk, 0, 0, 0)), bias_ptr);
+            }
+        }
+} else {
         for (int K_blk1 = 0; K_blk1 < jcp.dimK_nb_block; K_blk1++) {
             for (int K_blk2 = 0; K_blk2 < jcp.dimK_block; K_blk2++) {
 
@@ -498,6 +719,7 @@ void _jit_avx512_core_f32_wino_conv_4x3_t<is_fwd>::_execute_data_W_SGD(
                         &(output(0, M_blk, 0, 0, 0)), bias_ptr);
             }
         }
+}
     });
 }
 

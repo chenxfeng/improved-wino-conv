@@ -319,6 +319,9 @@ struct jit_conv_winograd_conf_t : public jit_conv_conf_t {
     int dimN_bcast_ur;
     int dimN_block;
     int dimN_nb_block;
+///my : new register block method
+int dimNregBlockRemain;
+int dimNblockRemain;
 
     winograd_sched_t sched_policy;
 };

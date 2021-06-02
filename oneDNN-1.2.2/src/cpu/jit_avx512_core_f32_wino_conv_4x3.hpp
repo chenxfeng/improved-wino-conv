@@ -90,13 +90,13 @@ struct _jit_avx512_core_f32_wino_conv_4x3_t {
 protected:
     void weight_transform_data(
             const jit_conv_winograd_conf_t &jcp, float *wp, float *twp) const;
-    void input_transform_data(int image, const jit_conv_winograd_conf_t &jcp,
-            float *inp, float *tinp) const;
+    // void input_transform_data(int image, const jit_conv_winograd_conf_t &jcp,
+    //         float *inp, float *tinp) const;
     void input_transform_tileblock_data(int tile_block,
             const jit_conv_winograd_conf_t &jcp, float *inp, float *tinp) const;
-    void output_transform_data(int image, const jit_conv_winograd_conf_t &jcp,
-            const post_ops_t &p_ops, float *toutp, float *pout_b,
-            float *bias) const;
+    // void output_transform_data(int image, const jit_conv_winograd_conf_t &jcp,
+    //         const post_ops_t &p_ops, float *toutp, float *pout_b,
+    //         float *bias) const;
     void output_transform_tileblock_data(int tile_block,
             const jit_conv_winograd_conf_t &jcp, const post_ops_t &p_ops,
             float *toutp, float *outp, float *bias) const;
@@ -108,6 +108,18 @@ protected:
             const memory_tracking::grantor_t &scratchpad) const;
     _jit_avx512_core_f32_wino_conv_4x3_data_kernel *kernel_;
     const primitive_attr_t *attr_;
+///my : new cache block method
+void input_transform_data(int image, const jit_conv_winograd_conf_t &jcp,
+        float *inp, float *tinp, int KnbBlock, int Kblock) const;
+void output_transform_data(int image, const jit_conv_winograd_conf_t &jcp,
+        const post_ops_t &p_ops, float *toutp, int MnbBlock, int Mblock, float *pout_b,
+        float *bias) const;
+///my : new register block method
+void input_transform_tileblock_data_tail(int tile_block,
+        const jit_conv_winograd_conf_t &jcp, float *inp, float *tinp) const;
+void output_transform_tileblock_data_tail(int tile_block,
+        const jit_conv_winograd_conf_t &jcp, const post_ops_t &p_ops,
+        float *toutp, float *outp, float *bias) const;
 
 private:
     DNNL_DISALLOW_COPY_AND_ASSIGN(_jit_avx512_core_f32_wino_conv_4x3_t);
@@ -148,6 +160,19 @@ struct jit_avx512_core_f32_wino_conv_4x3_fwd_t
 
             auto scratchpad = scratchpad_registry().registrar();
             winograd_avx512_core::init_scratchpad(scratchpad, jcp_);
+
+// while (jcp_.sched_policy == WSCHED_DATA_W_S_G_D) {
+//     ///execute winograd convolution and record/print info
+//     this->_execute_data_W_S_G_D((float *)src, dst, (float *)weights, (float *)bias, scratchpad);
+//     ///change block argument until exceed the limit
+//     if (get_new_Nblock() > MAX_NBLOCK) break;
+//     status_t status = jit_avx512_core_f32_wino_conv_4x3_fwd_kernel::init_conf(
+//                 (pd()->jcp_), *desc(), src_md_, weights_md_, dst_md_, *attr());
+//     if (status != status::success) {
+//         printf("error in search Nblock\n");
+//         break;
+//     }
+// }
 
             return status;
         }

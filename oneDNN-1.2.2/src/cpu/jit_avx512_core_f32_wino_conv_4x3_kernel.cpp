@@ -22,6 +22,8 @@
 
 #include <math.h>
 
+#include "verbose.hpp"
+
 #include "jit_avx512_core_f32_wino_conv_4x3_kernel.hpp"
 
 #define GET_OFF(field) offsetof(jit_wino_transform_call_s, field)
@@ -167,6 +169,10 @@ bool check_L2_block_per_thread(jit_conv_winograd_conf_t &jcp, int dimN_block,
     float L2_lb = C2_min * L2_cache_size;
     float L2_ub = C2_max * L2_cache_size;
     return (block_size > L2_lb && block_size < L2_ub);
+}
+///my : function for w_sgd
+bool check_L2_block_for_W_SGD(jit_conv_winograd_conf_t &jcp, int dimN_block) {
+    return jcp.oc + jcp.ic <= 192+256;
 }
 
 bool check_L1_block_gemm(jit_conv_winograd_conf_t &jcp, int dimK_block,
@@ -352,7 +358,10 @@ void _jit_avx512_core_f32_wino_conv_4x3_data_kernel::gemm_loop_generate() {
             }
         }
         add(reg_srcA, jcp.dimK_reg_block * 64);
+if (jcp.sched_policy == WSCHED_DATA_W_SGD)
         add(reg_srcB, jcp.dimN_reg_block * 64);
+else ///my : new data layout for input buffer
+add(reg_srcB, alpha*alpha*jcp.dimN_block * jcp.dimN_reg_block * 64);//next Kblock
         if (jcp.dimK_block > 1) {
             sub(reg_dimK_block_loop_cnt, 1);
             jnz(dimK_block_loop);
@@ -368,8 +377,315 @@ void _jit_avx512_core_f32_wino_conv_4x3_data_kernel::gemm_loop_generate() {
         L(end_store);
 
         if (jcp.dimM_block > 1) {
+if (jcp.sched_policy == WSCHED_DATA_W_SGD)
             sub(reg_srcB, jcp.dimK_block * jcp.dimN_reg_block * 64);
+else ///my : new data layout for input buffer
+sub(reg_srcB, jcp.dimK_block * alpha*alpha*jcp.dimN_block * jcp.dimN_reg_block * 64);
             add(reg_dstC, jcp.dimM_reg_block * jcp.dimN_reg_block * 64);
+            if (jcp.kernel_kind == expl_bcast) {
+                add(reg_srcA,
+                        (jcp.dimM_reg_block - 1) * jcp.dimK_reg_block * 64
+                                * jcp.dimK_block);
+            }
+            sub(reg_dimM_block_loop_cnt, 1);
+            jnz(dimM_block_loop);
+        }
+    };
+
+    /* Preamble */
+    preamble();
+
+    /* kernel */
+    inner_loops();
+
+    /* Postamble */
+    postamble();
+    ret();
+}
+
+///my : new register block method
+void _jit_avx512_core_f32_wino_conv_4x3_data_kernel::gemm_loop_tail_generate() {
+///change all dimN_block and dimN_reg_block to dimNblockRemain and dimNregBlockRemain
+    auto zmm_srcA = [=]() { return Xbyak::Zmm(0); };
+    auto zmm_srcB = [=](int tile) {
+        int idx = 1 + tile;
+        assert(idx < 1 + jcp.dimNregBlockRemain);
+        return Xbyak::Zmm(idx);
+    };
+    auto zmm_dstC = [=](int dimM_reg_block, int tile) {
+        int idx {0};
+        if (jcp.kernel_kind == embd_bcast)
+            idx = 1 + tile;
+        else
+            idx = 1 + jcp.dimNregBlockRemain + dimM_reg_block * jcp.dimNregBlockRemain
+                    + tile;
+        assert(idx < 32);
+        return Xbyak::Zmm(idx);
+    };
+
+    auto prepare_output = [=]() {
+        for (int dimM_reg_block = 0; dimM_reg_block < jcp.dimM_reg_block;
+                dimM_reg_block++) {
+            for (int tile = 0; tile < jcp.dimNregBlockRemain; tile++) {
+                Zmm zmm = zmm_dstC(dimM_reg_block, tile);
+                vpxord(zmm, zmm, zmm);
+            }
+        }
+    };
+    auto store_output = [=](bool output_is_aligned) {
+        Label save;
+        cmp(reg_is_beta_zero, 0);
+        je(save, T_NEAR);
+
+        for (int dimM_reg_block = 0; dimM_reg_block < jcp.dimM_reg_block;
+                dimM_reg_block++) {
+            for (int tile = 0; tile < jcp.dimNregBlockRemain; tile++) {
+                Zmm zmm = zmm_dstC(dimM_reg_block, tile);
+                int output_offset
+                        = jcp.dimNregBlockRemain * dimM_reg_block * 64 + tile * 64;
+                vaddps(zmm, zmm, EVEX_compress_addr(reg_dstC, output_offset));
+            }
+        }
+
+        L(save);
+        for (int dimM_reg_block = 0; dimM_reg_block < jcp.dimM_reg_block;
+                dimM_reg_block++) {
+            for (int tile = 0; tile < jcp.dimNregBlockRemain; tile++) {
+                Zmm zmm = zmm_dstC(dimM_reg_block, tile);
+                int output_offset
+                        = jcp.dimNregBlockRemain * dimM_reg_block * 64 + tile * 64;
+
+                // In W_SGD, output will be reused.
+                if (output_is_aligned && jcp.dimK_nb_block == 1
+                        && jcp.sched_policy == WSCHED_DATA_W_S_G_D
+                        && (jcp.dimN * jcp.dimM * alpha * alpha * sizeof(float)
+                                > 2 * LLC_data_size))
+                    vmovntps(EVEX_compress_addr(reg_dstC, output_offset), zmm);
+                else
+                    vmovups(EVEX_compress_addr(reg_dstC, output_offset), zmm);
+            }
+        }
+    };
+
+    auto inner_loops = [=]() {
+        Label dimM_block_loop, dimK_block_loop;
+
+        if (jcp.dimM_block > 1) {
+            mov(reg_dimM_block_loop_cnt, jcp.dimM_block);
+            L(dimM_block_loop);
+        }
+
+        prepare_output();
+
+        if (jcp.dimK_block > 1) {
+            mov(reg_dimK_block_loop_cnt, jcp.dimK_block);
+            L(dimK_block_loop);
+        }
+
+        for (int dimK_reg_block = 0; dimK_reg_block < jcp.dimK_reg_block;
+                dimK_reg_block++) {
+
+            if (jcp.kernel_kind == expl_bcast) {
+                for (int tile = 0; tile < jcp.dimNregBlockRemain; tile++) {
+                    vbroadcastss(zmm_srcB(tile),
+                            ptr[reg_srcB + 64 * tile + dimK_reg_block * 4]);
+                }
+            }
+
+            /* Performing the fmas */
+
+            for (int dimM_reg_block = 0; dimM_reg_block < jcp.dimM_reg_block;
+                    dimM_reg_block++) {
+
+                vmovups(zmm_srcA(),
+                        zword[reg_srcA
+                                + jcp.dimK_reg_block * jcp.dimK_block * 64
+                                        * dimM_reg_block
+                                + dimK_reg_block * 64]);
+
+                for (int tile = 0; tile < jcp.dimNregBlockRemain; tile++) {
+                    if (jcp.kernel_kind == expl_bcast)
+                        vfmadd231ps(zmm_dstC(dimM_reg_block, tile), zmm_srcA(),
+                                zmm_srcB(tile));
+                    else
+                        vfmadd231ps(zmm_dstC(dimM_reg_block, tile), zmm_srcA(),
+                                EVEX_compress_addr(reg_srcB,
+                                        64 * tile + dimK_reg_block * 4, true));
+                }
+            }
+        }
+        add(reg_srcA, jcp.dimK_reg_block * 64);
+        add(reg_srcB, jcp.dimNregBlockRemain * 64); ///my : no change for W_SGD
+        if (jcp.dimK_block > 1) {
+            sub(reg_dimK_block_loop_cnt, 1);
+            jnz(dimK_block_loop);
+        }
+
+        Label unaligned_store, end_store;
+        test(reg_dstC, cpu_isa_traits<avx512_core>::vlen - 1);
+        jnz(unaligned_store, T_NEAR);
+        store_output(true);
+        jmp(end_store, T_NEAR);
+        L(unaligned_store);
+        { store_output(false); }
+        L(end_store);
+
+        if (jcp.dimM_block > 1) {
+            sub(reg_srcB, jcp.dimK_block * jcp.dimNregBlockRemain * 64);///my : no change for W_SGD
+            add(reg_dstC, jcp.dimM_reg_block * jcp.dimNregBlockRemain * 64);
+            if (jcp.kernel_kind == expl_bcast) {
+                add(reg_srcA,
+                        (jcp.dimM_reg_block - 1) * jcp.dimK_reg_block * 64
+                                * jcp.dimK_block);
+            }
+            sub(reg_dimM_block_loop_cnt, 1);
+            jnz(dimM_block_loop);
+        }
+    };
+
+    /* Preamble */
+    preamble();
+
+    /* kernel */
+    inner_loops();
+
+    /* Postamble */
+    postamble();
+    ret();
+}
+
+///my : new cache block method
+void _jit_avx512_core_f32_wino_conv_4x3_data_kernel::gemm_loop_foot_generate() {
+///change all dimN_block and dimN_reg_block to dimNblockRemain and dimNregBlockRemain
+    auto zmm_srcA = [=]() { return Xbyak::Zmm(0); };
+    auto zmm_srcB = [=](int tile) {
+        int idx = 1 + tile;
+        assert(idx < 1 + jcp.dimNregBlockRemain);
+        return Xbyak::Zmm(idx);
+    };
+    auto zmm_dstC = [=](int dimM_reg_block, int tile) {
+        int idx {0};
+        if (jcp.kernel_kind == embd_bcast)
+            idx = 1 + tile;
+        else
+            idx = 1 + jcp.dimNregBlockRemain + dimM_reg_block * jcp.dimNregBlockRemain
+                    + tile;
+        assert(idx < 32);
+        return Xbyak::Zmm(idx);
+    };
+
+    auto prepare_output = [=]() {
+        for (int dimM_reg_block = 0; dimM_reg_block < jcp.dimM_reg_block;
+                dimM_reg_block++) {
+            for (int tile = 0; tile < jcp.dimNregBlockRemain; tile++) {
+                Zmm zmm = zmm_dstC(dimM_reg_block, tile);
+                vpxord(zmm, zmm, zmm);
+            }
+        }
+    };
+    auto store_output = [=](bool output_is_aligned) {
+        Label save;
+        cmp(reg_is_beta_zero, 0);
+        je(save, T_NEAR);
+
+        for (int dimM_reg_block = 0; dimM_reg_block < jcp.dimM_reg_block;
+                dimM_reg_block++) {
+            for (int tile = 0; tile < jcp.dimNregBlockRemain; tile++) {
+                Zmm zmm = zmm_dstC(dimM_reg_block, tile);
+                int output_offset
+                        = jcp.dimNregBlockRemain * dimM_reg_block * 64 + tile * 64;
+                vaddps(zmm, zmm, EVEX_compress_addr(reg_dstC, output_offset));
+            }
+        }
+
+        L(save);
+        for (int dimM_reg_block = 0; dimM_reg_block < jcp.dimM_reg_block;
+                dimM_reg_block++) {
+            for (int tile = 0; tile < jcp.dimNregBlockRemain; tile++) {
+                Zmm zmm = zmm_dstC(dimM_reg_block, tile);
+                int output_offset
+                        = jcp.dimNregBlockRemain * dimM_reg_block * 64 + tile * 64;
+
+                // In W_SGD, output will be reused.
+                if (output_is_aligned && jcp.dimK_nb_block == 1
+                        && jcp.sched_policy == WSCHED_DATA_W_S_G_D
+                        && (jcp.dimN * jcp.dimM * alpha * alpha * sizeof(float)
+                                > 2 * LLC_data_size))
+                    vmovntps(EVEX_compress_addr(reg_dstC, output_offset), zmm);
+                else
+                    vmovups(EVEX_compress_addr(reg_dstC, output_offset), zmm);
+            }
+        }
+    };
+
+    auto inner_loops = [=]() {
+        Label dimM_block_loop, dimK_block_loop;
+
+        if (jcp.dimM_block > 1) {
+            mov(reg_dimM_block_loop_cnt, jcp.dimM_block);
+            L(dimM_block_loop);
+        }
+
+        prepare_output();
+
+        if (jcp.dimK_block > 1) {
+            mov(reg_dimK_block_loop_cnt, jcp.dimK_block);
+            L(dimK_block_loop);
+        }
+
+        for (int dimK_reg_block = 0; dimK_reg_block < jcp.dimK_reg_block;
+                dimK_reg_block++) {
+
+            if (jcp.kernel_kind == expl_bcast) {
+                for (int tile = 0; tile < jcp.dimNregBlockRemain; tile++) {
+                    vbroadcastss(zmm_srcB(tile),
+                            ptr[reg_srcB + 64 * tile + dimK_reg_block * 4]);
+                }
+            }
+
+            /* Performing the fmas */
+
+            for (int dimM_reg_block = 0; dimM_reg_block < jcp.dimM_reg_block;
+                    dimM_reg_block++) {
+
+                vmovups(zmm_srcA(),
+                        zword[reg_srcA
+                                + jcp.dimK_reg_block * jcp.dimK_block * 64
+                                        * dimM_reg_block
+                                + dimK_reg_block * 64]);
+
+                for (int tile = 0; tile < jcp.dimNregBlockRemain; tile++) {
+                    if (jcp.kernel_kind == expl_bcast)
+                        vfmadd231ps(zmm_dstC(dimM_reg_block, tile), zmm_srcA(),
+                                zmm_srcB(tile));
+                    else
+                        vfmadd231ps(zmm_dstC(dimM_reg_block, tile), zmm_srcA(),
+                                EVEX_compress_addr(reg_srcB,
+                                        64 * tile + dimK_reg_block * 4, true));
+                }
+            }
+        }
+        add(reg_srcA, jcp.dimK_reg_block * 64);
+///my : new data layout for input buffer
+add(reg_srcB, alpha*alpha*jcp.dimNblockRemain * jcp.dimNregBlockRemain * 64);//next Kblock
+        if (jcp.dimK_block > 1) {
+            sub(reg_dimK_block_loop_cnt, 1);
+            jnz(dimK_block_loop);
+        }
+
+        Label unaligned_store, end_store;
+        test(reg_dstC, cpu_isa_traits<avx512_core>::vlen - 1);
+        jnz(unaligned_store, T_NEAR);
+        store_output(true);
+        jmp(end_store, T_NEAR);
+        L(unaligned_store);
+        { store_output(false); }
+        L(end_store);
+
+        if (jcp.dimM_block > 1) {
+///my : new data layout for input buffer
+sub(reg_srcB, jcp.dimK_block * alpha*alpha*jcp.dimNblockRemain * jcp.dimNregBlockRemain * 64);
+            add(reg_dstC, jcp.dimM_reg_block * jcp.dimNregBlockRemain * 64);
             if (jcp.kernel_kind == expl_bcast) {
                 add(reg_srcA,
                         (jcp.dimM_reg_block - 1) * jcp.dimK_reg_block * 64
@@ -876,6 +1192,456 @@ void _jit_avx512_core_f32_wino_conv_4x3_data_kernel ::
     postamble();
 }
 
+///my : new register block method
+void _jit_avx512_core_f32_wino_conv_4x3_data_kernel ::
+        output_transform_data_tail_ker_generate() {
+    bool is_fwd = one_of(
+            jcp.prop_kind, dnnl_forward_training, dnnl_forward_inference);
+    int outw = is_fwd ? jcp.ow : jcp.iw;
+    int outh = is_fwd ? jcp.oh : jcp.ih;
+    bool not_tiled = jcp.sched_policy == WSCHED_DATA_W_S_G_D;
+    bool with_bias = jcp.with_bias;
+    bool with_relu = jcp.with_eltwise;
+    bool with_relu_postsum = jcp.with_relu_postsum;
+    bool with_sum = jcp.with_sum;
+
+    auto zmm_zero = Xbyak::Zmm(0);
+    auto zmm_temp = Xbyak::Zmm(31);
+    auto zmm_G = [=](int i) { return Xbyak::Zmm(1 + i); };
+    auto zmm_O = [=](int i) { return Xbyak::Zmm(1 + alpha + i); };
+    auto zmm_T = [=](int i) { return Xbyak::Zmm(1 + 2 * alpha + i); };
+    auto zmm_t = [=](int i) { return Xbyak::Zmm(1 + 3 * alpha + i); };
+
+    auto init_G = [=]() {
+        mov(oreg_temp, ptr[param1 + GET_OFF(G)]);
+        for (int i = 0; i < 6; i++) {
+            vbroadcastss(zmm_G(i), ptr[oreg_temp + i * typesize]);
+        }
+    };
+///change all dimN_block and dimN_reg_block to dimNblockRemain and dimNregBlockRemain
+    auto load_src = [=]() {
+        mov(oreg_Ow, ptr[param1 + GET_OFF(Mw)]);
+        mov(oreg_src, ptr[param1 + GET_OFF(src)]);
+
+        mov(oreg_nb_tile_block_ur, ptr[param1 + GET_OFF(nb_tile_block_ur)]);
+        imul(oreg_nb_tile_block_ur, oreg_nb_tile_block_ur,
+                (jcp.dimM_block * jcp.dimM_reg_block) * jcp.dimNregBlockRemain
+                        * jcp.dimM_simd_block * typesize);
+        add(oreg_src, oreg_nb_tile_block_ur);
+
+        mov(oreg_tile_block_ur, ptr[param1 + GET_OFF(tile_block_ur)]);
+        imul(oreg_tile_block_ur, oreg_tile_block_ur,
+                jcp.dimM_simd_block * typesize);
+        add(oreg_src, oreg_tile_block_ur);
+
+        if (not_tiled) { ///never reached code
+            mov(oreg_tile_block, ptr[param1 + GET_OFF(tile_block)]);
+            imul(oreg_tile_block, oreg_tile_block,
+                    jcp.dimM_nb_block * alpha * alpha * jcp.dimNblockRemain
+                            * (jcp.dimM_block * jcp.dimM_reg_block)
+                            * jcp.dimNregBlockRemain * jcp.dimM_simd_block
+                            * typesize);
+            add(oreg_src, oreg_tile_block);
+        }
+
+        int last4dim = jcp.dimNblockRemain * (jcp.dimM_block * jcp.dimM_reg_block)
+                * jcp.dimNregBlockRemain * jcp.dimM_simd_block * typesize;
+        for (int j = 0; j < alpha; j++) {
+            for (int i = 0; i < alpha; i++) {
+                int j_base_offset = j * alpha * last4dim;
+                int i_base_offset = i * last4dim;
+                vmovups(zmm_temp,
+                        ptr[oreg_src + j_base_offset + i_base_offset]);
+                vmovups(ptr[oreg_Ow
+                                + (j * alpha * simd_w + i * simd_w) * typesize],
+                        zmm_temp);
+            }
+        }
+    };
+
+    auto store_dst = [=]() {
+        vpxord(zmm_zero, zmm_zero, zmm_zero);
+        mov(oreg_dst, ptr[param1 + GET_OFF(dst)]);
+        mov(oreg_O, ptr[param1 + GET_OFF(M)]);
+        mov(oreg_ydim, ptr[param1 + GET_OFF(tj)]);
+        shl(oreg_ydim, 2); // tj * tile_size (==4)
+        mov(oreg_xdim, ptr[param1 + GET_OFF(ti)]);
+        shl(oreg_xdim, 2); // ti * tilesize (==4)
+
+        if (with_bias) mov(oreg_bias, ptr[param1 + GET_OFF(bias)]);
+
+        auto store_one = [=](int j, int i, bool is_aligned) {
+            auto zmm_O = Xbyak::Zmm(31);
+            auto zmm_relu_ns = Xbyak::Zmm(30);
+            auto xmm_relu_ns = Xbyak::Xmm(30);
+            int offset = (j * tile_size * simd_w + i * simd_w) * typesize;
+
+            vmovups(zmm_O, ptr[oreg_O + offset]);
+            if (is_fwd) {
+                if (with_bias) { vaddps(zmm_O, zmm_O, ptr[oreg_bias]); }
+                if (with_relu) {
+                    if (jcp.eltwise.alpha == 0) {
+                        vmaxps(zmm_O, zmm_O, zmm_zero);
+                    } else {
+                        Opmask kmask = Opmask(7);
+                        mov(imm_addr64, float2int(jcp.eltwise.alpha));
+                        vmovq(xmm_relu_ns, imm_addr64);
+                        vbroadcastss(zmm_relu_ns, xmm_relu_ns);
+                        vcmpps(kmask, zmm_O, zmm_zero, _cmp_lt_os);
+                        vmulps(zmm_O | kmask, zmm_O, zmm_relu_ns);
+                    }
+                }
+            }
+            if (with_sum) {
+                vaddps(zmm_O, zmm_O, ptr[oreg_out_j + oreg_temp]);
+                if (with_relu_postsum) // orig: with_relu_postsum
+                    vmaxps(zmm_O, zmm_O, zmm_zero);
+            }
+            if (is_aligned)
+                vmovntps(ptr[oreg_out_j + oreg_temp], zmm_O);
+            else
+                vmovups(ptr[oreg_out_j + oreg_temp], zmm_O);
+        };
+
+        auto i_loop = [=](int j, bool is_aligned) {
+            for (int i = 0; i < tile_size; i++) {
+                Label next;
+                mov(oreg_temp, oreg_xdim);
+                add(oreg_temp, i);
+                cmp(oreg_temp, outw);
+                jge(next, T_NEAR);
+                shl(oreg_temp, 4 + 2); // * 16 * 4
+
+                store_one(j, i, is_aligned);
+
+                L(next);
+            }
+        };
+
+        for (int j = 0; j < tile_size; j++) {
+            Label next, unaligned;
+            mov(oreg_temp, oreg_ydim);
+            add(oreg_temp, j);
+            cmp(oreg_temp, outh);
+            jge(next, T_NEAR);
+
+            mov(oreg_out_j, oreg_dst);
+            imul(oreg_temp, oreg_temp, outw * simd_w * typesize);
+            add(oreg_out_j, oreg_temp);
+
+            test(oreg_dst, 63);
+            jnz(unaligned, T_NEAR);
+
+            i_loop(j, true);
+            jmp(next, T_NEAR);
+
+            L(unaligned);
+            i_loop(j, false);
+
+            L(next);
+        }
+    };
+
+    auto trans_O_4x4_3x3 = [=]() {
+        auto fma2 = [=](Zmm dst, Zmm v1, Zmm u1, Zmm v2, Zmm u2) {
+            vmulps(dst, v1, u1);
+            vfmadd231ps(dst, v2, u2);
+        };
+        mov(oreg_Ow, ptr[param1 + GET_OFF(Mw)]);
+        mov(oreg_T, ptr[param1 + GET_OFF(T)]);
+        mov(oreg_O, ptr[param1 + GET_OFF(M)]);
+
+        for (int i = 0; i < alpha; i++) {
+            for (int j = 0; j < alpha; j++) {
+                vmovups(zmm_O(j),
+                        ptr[oreg_Ow
+                                + (j * alpha * simd_w + i * simd_w)
+                                        * typesize]);
+            }
+
+            vaddps(zmm_t(0), zmm_O(1), zmm_O(2));
+            vaddps(zmm_t(1), zmm_O(3), zmm_O(4));
+            vsubps(zmm_t(2), zmm_O(1), zmm_O(2));
+            vsubps(zmm_t(3), zmm_O(3), zmm_O(4));
+
+            vaddps(zmm_T(0), zmm_t(0), zmm_t(1));
+            vaddps(zmm_T(0), zmm_T(0), zmm_O(0));
+            fma2(zmm_T(1), zmm_t(2), zmm_G(0), zmm_t(3), zmm_G(1));
+            fma2(zmm_T(2), zmm_t(0), zmm_G(2), zmm_t(1), zmm_G(3));
+            fma2(zmm_T(3), zmm_t(2), zmm_G(4), zmm_t(3), zmm_G(5));
+            vaddps(zmm_T(3), zmm_T(3), zmm_O(5));
+
+            for (int j = 0; j < tile_size; j++) {
+                vmovups(ptr[oreg_T
+                                + (j * alpha * simd_w + i * simd_w) * typesize],
+                        zmm_T(j));
+            }
+        }
+        for (int j = 0; j < tile_size; j++) {
+            for (int i = 0; i < alpha; i++) {
+                vmovups(zmm_T(i),
+                        ptr[oreg_T
+                                + (j * alpha * simd_w + i * simd_w)
+                                        * typesize]);
+            }
+            vaddps(zmm_t(0), zmm_T(1), zmm_T(2));
+            vaddps(zmm_t(1), zmm_T(3), zmm_T(4));
+            vsubps(zmm_t(2), zmm_T(1), zmm_T(2));
+            vsubps(zmm_t(3), zmm_T(3), zmm_T(4));
+
+            vaddps(zmm_O(0), zmm_t(0), zmm_t(1));
+            vaddps(zmm_O(0), zmm_O(0), zmm_T(0));
+            fma2(zmm_O(1), zmm_t(2), zmm_G(0), zmm_t(3), zmm_G(1));
+            fma2(zmm_O(2), zmm_t(0), zmm_G(2), zmm_t(1), zmm_G(3));
+            fma2(zmm_O(3), zmm_t(2), zmm_G(4), zmm_t(3), zmm_G(5));
+            vaddps(zmm_O(3), zmm_O(3), zmm_T(5));
+
+            for (int i = 0; i < tile_size; i++) {
+                vmovups(ptr[oreg_O
+                                + (j * tile_size * simd_w + i * simd_w)
+                                        * typesize],
+                        zmm_O(i));
+            }
+        }
+    };
+
+    auto inner_loops = [=]() {
+        init_G();
+        load_src();
+        trans_O_4x4_3x3();
+        store_dst();
+    };
+
+    preamble();
+    inner_loops();
+    postamble();
+}
+
+///my : new cache block method
+void _jit_avx512_core_f32_wino_conv_4x3_data_kernel ::
+        output_transform_data_foot_ker_generate() {
+    bool is_fwd = one_of(
+            jcp.prop_kind, dnnl_forward_training, dnnl_forward_inference);
+    int outw = is_fwd ? jcp.ow : jcp.iw;
+    int outh = is_fwd ? jcp.oh : jcp.ih;
+    bool not_tiled = jcp.sched_policy == WSCHED_DATA_W_S_G_D;
+    bool with_bias = jcp.with_bias;
+    bool with_relu = jcp.with_eltwise;
+    bool with_relu_postsum = jcp.with_relu_postsum;
+    bool with_sum = jcp.with_sum;
+
+    auto zmm_zero = Xbyak::Zmm(0);
+    auto zmm_temp = Xbyak::Zmm(31);
+    auto zmm_G = [=](int i) { return Xbyak::Zmm(1 + i); };
+    auto zmm_O = [=](int i) { return Xbyak::Zmm(1 + alpha + i); };
+    auto zmm_T = [=](int i) { return Xbyak::Zmm(1 + 2 * alpha + i); };
+    auto zmm_t = [=](int i) { return Xbyak::Zmm(1 + 3 * alpha + i); };
+
+    auto init_G = [=]() {
+        mov(oreg_temp, ptr[param1 + GET_OFF(G)]);
+        for (int i = 0; i < 6; i++) {
+            vbroadcastss(zmm_G(i), ptr[oreg_temp + i * typesize]);
+        }
+    };
+///change all dimN_block and dimN_reg_block to dimNblockRemain and dimNregBlockRemain
+    auto load_src = [=]() {
+        mov(oreg_Ow, ptr[param1 + GET_OFF(Mw)]);
+        mov(oreg_src, ptr[param1 + GET_OFF(src)]);
+
+        mov(oreg_nb_tile_block_ur, ptr[param1 + GET_OFF(nb_tile_block_ur)]);
+        imul(oreg_nb_tile_block_ur, oreg_nb_tile_block_ur,
+                (jcp.dimM_block * jcp.dimM_reg_block) * jcp.dimNregBlockRemain
+                        * jcp.dimM_simd_block * typesize);
+        add(oreg_src, oreg_nb_tile_block_ur);
+
+        mov(oreg_tile_block_ur, ptr[param1 + GET_OFF(tile_block_ur)]);
+        imul(oreg_tile_block_ur, oreg_tile_block_ur,
+                jcp.dimM_simd_block * typesize);
+        add(oreg_src, oreg_tile_block_ur);
+
+        if (not_tiled) {///except this block for correct offset
+            mov(oreg_tile_block, ptr[param1 + GET_OFF(tile_block)]);
+            imul(oreg_tile_block, oreg_tile_block,
+                    jcp.dimM_nb_block * alpha * alpha * jcp.dimN_block
+                            * (jcp.dimM_block * jcp.dimM_reg_block)
+                            * jcp.dimN_reg_block * jcp.dimM_simd_block
+                            * typesize);
+            add(oreg_src, oreg_tile_block);
+        }
+
+        int last4dim = jcp.dimNblockRemain * (jcp.dimM_block * jcp.dimM_reg_block)
+                * jcp.dimNregBlockRemain * jcp.dimM_simd_block * typesize;
+        for (int j = 0; j < alpha; j++) {
+            for (int i = 0; i < alpha; i++) {
+                int j_base_offset = j * alpha * last4dim;
+                int i_base_offset = i * last4dim;
+                vmovups(zmm_temp,
+                        ptr[oreg_src + j_base_offset + i_base_offset]);
+                vmovups(ptr[oreg_Ow
+                                + (j * alpha * simd_w + i * simd_w) * typesize],
+                        zmm_temp);
+            }
+        }
+    };
+
+    auto store_dst = [=]() {
+        vpxord(zmm_zero, zmm_zero, zmm_zero);
+        mov(oreg_dst, ptr[param1 + GET_OFF(dst)]);
+        mov(oreg_O, ptr[param1 + GET_OFF(M)]);
+        mov(oreg_ydim, ptr[param1 + GET_OFF(tj)]);
+        shl(oreg_ydim, 2); // tj * tile_size (==4)
+        mov(oreg_xdim, ptr[param1 + GET_OFF(ti)]);
+        shl(oreg_xdim, 2); // ti * tilesize (==4)
+
+        if (with_bias) mov(oreg_bias, ptr[param1 + GET_OFF(bias)]);
+
+        auto store_one = [=](int j, int i, bool is_aligned) {
+            auto zmm_O = Xbyak::Zmm(31);
+            auto zmm_relu_ns = Xbyak::Zmm(30);
+            auto xmm_relu_ns = Xbyak::Xmm(30);
+            int offset = (j * tile_size * simd_w + i * simd_w) * typesize;
+
+            vmovups(zmm_O, ptr[oreg_O + offset]);
+            if (is_fwd) {
+                if (with_bias) { vaddps(zmm_O, zmm_O, ptr[oreg_bias]); }
+                if (with_relu) {
+                    if (jcp.eltwise.alpha == 0) {
+                        vmaxps(zmm_O, zmm_O, zmm_zero);
+                    } else {
+                        Opmask kmask = Opmask(7);
+                        mov(imm_addr64, float2int(jcp.eltwise.alpha));
+                        vmovq(xmm_relu_ns, imm_addr64);
+                        vbroadcastss(zmm_relu_ns, xmm_relu_ns);
+                        vcmpps(kmask, zmm_O, zmm_zero, _cmp_lt_os);
+                        vmulps(zmm_O | kmask, zmm_O, zmm_relu_ns);
+                    }
+                }
+            }
+            if (with_sum) {
+                vaddps(zmm_O, zmm_O, ptr[oreg_out_j + oreg_temp]);
+                if (with_relu_postsum) // orig: with_relu_postsum
+                    vmaxps(zmm_O, zmm_O, zmm_zero);
+            }
+            if (is_aligned)
+                vmovntps(ptr[oreg_out_j + oreg_temp], zmm_O);
+            else
+                vmovups(ptr[oreg_out_j + oreg_temp], zmm_O);
+        };
+
+        auto i_loop = [=](int j, bool is_aligned) {
+            for (int i = 0; i < tile_size; i++) {
+                Label next;
+                mov(oreg_temp, oreg_xdim);
+                add(oreg_temp, i);
+                cmp(oreg_temp, outw);
+                jge(next, T_NEAR);
+                shl(oreg_temp, 4 + 2); // * 16 * 4
+
+                store_one(j, i, is_aligned);
+
+                L(next);
+            }
+        };
+
+        for (int j = 0; j < tile_size; j++) {
+            Label next, unaligned;
+            mov(oreg_temp, oreg_ydim);
+            add(oreg_temp, j);
+            cmp(oreg_temp, outh);
+            jge(next, T_NEAR);
+
+            mov(oreg_out_j, oreg_dst);
+            imul(oreg_temp, oreg_temp, outw * simd_w * typesize);
+            add(oreg_out_j, oreg_temp);
+
+            test(oreg_dst, 63);
+            jnz(unaligned, T_NEAR);
+
+            i_loop(j, true);
+            jmp(next, T_NEAR);
+
+            L(unaligned);
+            i_loop(j, false);
+
+            L(next);
+        }
+    };
+
+    auto trans_O_4x4_3x3 = [=]() {
+        auto fma2 = [=](Zmm dst, Zmm v1, Zmm u1, Zmm v2, Zmm u2) {
+            vmulps(dst, v1, u1);
+            vfmadd231ps(dst, v2, u2);
+        };
+        mov(oreg_Ow, ptr[param1 + GET_OFF(Mw)]);
+        mov(oreg_T, ptr[param1 + GET_OFF(T)]);
+        mov(oreg_O, ptr[param1 + GET_OFF(M)]);
+
+        for (int i = 0; i < alpha; i++) {
+            for (int j = 0; j < alpha; j++) {
+                vmovups(zmm_O(j),
+                        ptr[oreg_Ow
+                                + (j * alpha * simd_w + i * simd_w)
+                                        * typesize]);
+            }
+
+            vaddps(zmm_t(0), zmm_O(1), zmm_O(2));
+            vaddps(zmm_t(1), zmm_O(3), zmm_O(4));
+            vsubps(zmm_t(2), zmm_O(1), zmm_O(2));
+            vsubps(zmm_t(3), zmm_O(3), zmm_O(4));
+
+            vaddps(zmm_T(0), zmm_t(0), zmm_t(1));
+            vaddps(zmm_T(0), zmm_T(0), zmm_O(0));
+            fma2(zmm_T(1), zmm_t(2), zmm_G(0), zmm_t(3), zmm_G(1));
+            fma2(zmm_T(2), zmm_t(0), zmm_G(2), zmm_t(1), zmm_G(3));
+            fma2(zmm_T(3), zmm_t(2), zmm_G(4), zmm_t(3), zmm_G(5));
+            vaddps(zmm_T(3), zmm_T(3), zmm_O(5));
+
+            for (int j = 0; j < tile_size; j++) {
+                vmovups(ptr[oreg_T
+                                + (j * alpha * simd_w + i * simd_w) * typesize],
+                        zmm_T(j));
+            }
+        }
+        for (int j = 0; j < tile_size; j++) {
+            for (int i = 0; i < alpha; i++) {
+                vmovups(zmm_T(i),
+                        ptr[oreg_T
+                                + (j * alpha * simd_w + i * simd_w)
+                                        * typesize]);
+            }
+            vaddps(zmm_t(0), zmm_T(1), zmm_T(2));
+            vaddps(zmm_t(1), zmm_T(3), zmm_T(4));
+            vsubps(zmm_t(2), zmm_T(1), zmm_T(2));
+            vsubps(zmm_t(3), zmm_T(3), zmm_T(4));
+
+            vaddps(zmm_O(0), zmm_t(0), zmm_t(1));
+            vaddps(zmm_O(0), zmm_O(0), zmm_T(0));
+            fma2(zmm_O(1), zmm_t(2), zmm_G(0), zmm_t(3), zmm_G(1));
+            fma2(zmm_O(2), zmm_t(0), zmm_G(2), zmm_t(1), zmm_G(3));
+            fma2(zmm_O(3), zmm_t(2), zmm_G(4), zmm_t(3), zmm_G(5));
+            vaddps(zmm_O(3), zmm_O(3), zmm_T(5));
+
+            for (int i = 0; i < tile_size; i++) {
+                vmovups(ptr[oreg_O
+                                + (j * tile_size * simd_w + i * simd_w)
+                                        * typesize],
+                        zmm_O(i));
+            }
+        }
+    };
+
+    auto inner_loops = [=]() {
+        init_G();
+        load_src();
+        trans_O_4x4_3x3();
+        store_dst();
+    };
+
+    preamble();
+    inner_loops();
+    postamble();
+}
+
 void _jit_avx512_core_f32_wino_conv_4x3_data_kernel ::
         input_transform_data_ker_generate() {
     bool is_fwd = one_of(
@@ -973,10 +1739,16 @@ void _jit_avx512_core_f32_wino_conv_4x3_data_kernel ::
                             * jcp.dimK_reg_block * typesize);
         }
 
+if (jcp.sched_policy == WSCHED_DATA_W_SGD) {
         mov(ireg_nb_tile_block_ur, ptr[param1 + GET_OFF(nb_tile_block_ur)]);
         imul(ireg_nb_tile_block_ur, ireg_nb_tile_block_ur,
                 jcp.dimK_nb_block * jcp.dimK_block * jcp.dimN_reg_block
                         * jcp.dimK_reg_block * typesize);
+} else {///my : new data layout for input buffer
+mov(ireg_nb_tile_block_ur, ptr[param1 + GET_OFF(nb_tile_block_ur)]);
+imul(ireg_nb_tile_block_ur, ireg_nb_tile_block_ur,
+        jcp.dimN_reg_block * jcp.dimK_reg_block * typesize);
+}
 
         mov(ireg_tile_block_ur, ptr[param1 + GET_OFF(tile_block_ur)]);
         imul(ireg_tile_block_ur, ireg_tile_block_ur,
@@ -993,11 +1765,244 @@ void _jit_avx512_core_f32_wino_conv_4x3_data_kernel ::
                                 + (j * alpha * simd_w + i * simd_w)
                                         * typesize]);
 
-                int j_base_offset = j * alpha * jcp.dimN_block
+int j_base_offset, i_base_offset;
+if (jcp.sched_policy == WSCHED_DATA_W_SGD) {
+                j_base_offset = j * alpha * jcp.dimN_block
                         * jcp.dimK_nb_block * jcp.dimK_block
                         * jcp.dimN_reg_block * jcp.dimK_reg_block * typesize;
-                int i_base_offset = i * jcp.dimN_block * jcp.dimK_nb_block
+                i_base_offset = i * jcp.dimN_block * jcp.dimK_nb_block
                         * jcp.dimK_block * jcp.dimN_reg_block
+                        * jcp.dimK_reg_block * typesize;
+} else {///my : new data layout for input buffer
+j_base_offset = j * alpha * jcp.dimN_block * jcp.dimN_reg_block * jcp.dimK_reg_block * typesize;
+i_base_offset = i * jcp.dimN_block * jcp.dimN_reg_block * jcp.dimK_reg_block * typesize;
+}
+
+                if (not_tiled && streamout)
+                    vmovntps(ptr[ireg_output + j_base_offset + i_base_offset],
+                            zmm_temp);
+                else
+                    vmovups(ptr[ireg_output + j_base_offset + i_base_offset],
+                            zmm_temp);
+            }
+        }
+    };
+
+    auto fma4 = [=](Zmm dst, Zmm a, Zmm b, Zmm c) {
+        vmulps(zmm_temp, a, b);
+        vaddps(dst, zmm_temp, c);
+    };
+
+    auto trans_I_4x4_3x3 = [=]() {
+        mov(ireg_Iw, ptr[param1 + GET_OFF(Mw)]);
+        mov(ireg_T, ptr[param1 + GET_OFF(T)]);
+        mov(ireg_I, ptr[param1 + GET_OFF(M)]);
+
+        mov(ireg_output, ptr[param1 + GET_OFF(dst)]); // for prefetch
+        for (int i = 0; i < alpha; i++) {
+            for (int idx = 0; idx < alpha; idx++) {
+                vmovups(zmm_I(idx),
+                        ptr[ireg_I
+                                + (idx * alpha * simd_w + i * simd_w)
+                                        * typesize]);
+                ///my : don't prefetch here
+                // int j_base_offset = i * alpha * jcp.dimN_block
+                //         * jcp.dimK_nb_block * jcp.dimK_block
+                //         * jcp.dimN_reg_block * jcp.dimK_reg_block * typesize;
+                // int idx_base_offset = idx * jcp.dimN_block * jcp.dimK_nb_block
+                //         * jcp.dimK_block * jcp.dimN_reg_block
+                //         * jcp.dimK_reg_block * typesize;
+                // prefetcht0(ptr[ireg_output + j_base_offset + idx_base_offset]);
+            }
+
+            fma4(zmm_t(0), zmm_I(2), zmm_G(0), zmm_I(4));
+            fma4(zmm_t(1), zmm_I(1), zmm_G(0), zmm_I(3));
+            fma4(zmm_t(2), zmm_I(2), zmm_G(1), zmm_I(4));
+            fma4(zmm_t(3), zmm_I(1), zmm_G(1), zmm_I(3));
+            fma4(zmm_t(4), zmm_I(0), zmm_G(2), zmm_I(4));
+            fma4(zmm_t(5), zmm_I(1), zmm_G(2), zmm_I(5));
+
+            fma4(zmm_T(0), zmm_I(2), zmm_G(3), zmm_t(4));
+            fma4(zmm_T(1), zmm_t(1), zmm_G(4), zmm_t(0));
+            fma4(zmm_T(2), zmm_t(1), zmm_G(5), zmm_t(0));
+            fma4(zmm_T(3), zmm_t(3), zmm_G(6), zmm_t(2));
+            fma4(zmm_T(4), zmm_t(3), zmm_G(7), zmm_t(2));
+            fma4(zmm_T(5), zmm_I(3), zmm_G(8), zmm_t(5));
+
+            for (int idx = 0; idx < alpha; idx++) {
+                vmovups(ptr[ireg_T
+                                + (idx * alpha * simd_w + i * simd_w)
+                                        * typesize],
+                        zmm_T(idx));
+            }
+        }
+        for (int i = 0; i < alpha; i++) {
+            for (int idx = 0; idx < alpha; idx++) {
+                vmovups(zmm_T(idx),
+                        ptr[ireg_T
+                                + (i * alpha * simd_w + idx * simd_w)
+                                        * typesize]);
+            }
+
+            fma4(zmm_t(0), zmm_T(2), zmm_G(0), zmm_T(4));
+            fma4(zmm_t(1), zmm_T(1), zmm_G(0), zmm_T(3));
+            fma4(zmm_t(2), zmm_T(2), zmm_G(1), zmm_T(4));
+            fma4(zmm_t(3), zmm_T(1), zmm_G(1), zmm_T(3));
+            fma4(zmm_t(4), zmm_T(0), zmm_G(2), zmm_T(4));
+            fma4(zmm_t(5), zmm_T(1), zmm_G(2), zmm_T(5));
+
+            fma4(zmm_I(0), zmm_T(2), zmm_G(3), zmm_t(4));
+            fma4(zmm_I(1), zmm_t(1), zmm_G(4), zmm_t(0));
+            fma4(zmm_I(2), zmm_t(1), zmm_G(5), zmm_t(0));
+            fma4(zmm_I(3), zmm_t(3), zmm_G(6), zmm_t(2));
+            fma4(zmm_I(4), zmm_t(3), zmm_G(7), zmm_t(2));
+            fma4(zmm_I(5), zmm_T(3), zmm_G(8), zmm_t(5));
+
+            for (int idx = 0; idx < alpha; idx++) {
+                vmovups(ptr[ireg_Iw
+                                + (i * alpha * simd_w + idx * simd_w)
+                                        * typesize],
+                        zmm_I(idx));
+            }
+        }
+    };
+
+    auto inner_loops = [=]() {
+        init_G();
+        load_src();
+        trans_I_4x4_3x3();
+        store_Iw();
+    };
+
+    preamble();
+    inner_loops();
+    postamble();
+}
+
+///my : new register block method
+void _jit_avx512_core_f32_wino_conv_4x3_data_kernel ::
+        input_transform_data_tail_ker_generate() {
+    bool is_fwd = one_of(
+            jcp.prop_kind, dnnl_forward_training, dnnl_forward_inference);
+    int inpw = is_fwd ? jcp.iw : jcp.ow;
+    int inph = is_fwd ? jcp.ih : jcp.oh;
+    int l_pad = is_fwd ? jcp.l_pad : jcp.iw + jcp.r_pad - jcp.ow;
+    int t_pad = is_fwd ? jcp.t_pad : jcp.ih + jcp.t_pad - jcp.oh;
+    int wp_max = inpw + l_pad;
+    int hp_max = inph + t_pad;
+    bool not_tiled = jcp.sched_policy == WSCHED_DATA_W_S_G_D;
+    int G_size = 9;
+
+    auto zmm_zero = Xbyak::Zmm(0);
+    auto zmm_temp = Xbyak::Zmm(31);
+    auto zmm_G = [=](int i) { return Xbyak::Zmm(1 + i); };
+    auto zmm_I = [=](int i) { return Xbyak::Zmm(1 + G_size + i); };
+    auto zmm_T = [=](int i) { return Xbyak::Zmm(1 + G_size + alpha + i); };
+    auto zmm_t = [=](int i) { return Xbyak::Zmm(1 + G_size + 2 * alpha + i); };
+
+    auto init_G = [=]() {
+        mov(ireg_temp, ptr[param1 + GET_OFF(G)]);
+        for (int i = 0; i < G_size; i++) {
+            vbroadcastss(zmm_G(i), ptr[ireg_temp + i * typesize]);
+        }
+    };
+
+    auto load_src = [=]() {
+        mov(ireg_src, ptr[param1 + GET_OFF(src)]); // base addr of inp
+        mov(ireg_I, ptr[param1 + GET_OFF(M)]);
+
+        xor_(ireg_zero, ireg_zero);
+        vpxord(zmm_zero, zmm_zero, zmm_zero);
+
+        mov(ireg_ydim, ptr[param1 + GET_OFF(tj)]);
+        shl(ireg_ydim, 2); // tj * tile_size (==4)
+        mov(ireg_xdim, ptr[param1 + GET_OFF(ti)]);
+        shl(ireg_xdim, 2); // ti * tilesize (==4)
+
+        for (int j = 0; j < alpha; j++) {
+            mov(ireg_temp, ireg_ydim);
+            add(ireg_temp, j);
+
+            mov(ireg_mask_j, 0xffff);
+            cmp(ireg_temp, t_pad);
+            cmovl(ireg_mask_j, ireg_zero);
+            cmp(ireg_temp, hp_max);
+            cmovge(ireg_mask_j, ireg_zero);
+
+            sub(ireg_temp, t_pad);
+            imul(ireg_temp, ireg_temp, inpw * simd_w * typesize);
+            mov(ireg_inp_j, ireg_src);
+            add(ireg_inp_j, ireg_temp);
+
+            for (int i = 0; i < alpha; i++) {
+
+                mov(ireg_temp, ireg_xdim);
+                add(ireg_temp, i);
+
+                mov(ireg_mask, 0xffff);
+                cmp(ireg_temp, l_pad);
+                cmovl(ireg_mask, ireg_zero);
+                cmp(ireg_temp, wp_max);
+                cmovge(ireg_mask, ireg_zero);
+                and_(ireg_mask, ireg_mask_j);
+
+                sub(ireg_temp, l_pad);
+                shl(ireg_temp, 4 + 2);
+
+                vpxord(zmm_temp, zmm_temp, zmm_temp);
+                Opmask kmask = Opmask(7);
+                kmovw(kmask, ireg_mask_32);
+                vmovups(zmm_temp | kmask, ptr[ireg_inp_j + ireg_temp]);
+                vmovups(ptr[ireg_I
+                                + (j * alpha * simd_w + i * simd_w) * typesize],
+                        zmm_temp);
+            }
+        }
+    };
+///my : new register block method
+///change all dimN_block and dimN_reg_block to dimNblockRemain and dimNregBlockRemain
+    auto store_Iw = [=]() {
+        mov(ireg_Iw, ptr[param1 + GET_OFF(Mw)]);
+        mov(ireg_output, ptr[param1 + GET_OFF(dst)]);
+
+        bool streamout = jcp.dimN * jcp.dimK * alpha * alpha * sizeof(float)
+                        > 2 * LLC_data_size
+                ? true
+                : false;
+
+        if (not_tiled) {///never reached code
+            mov(ireg_tile_block, ptr[param1 + GET_OFF(tile_block)]);
+            imul(ireg_tile_block, ireg_tile_block,
+                    alpha * alpha * jcp.dimNblockRemain * jcp.dimK_nb_block
+                            * jcp.dimK_block * jcp.dimNregBlockRemain
+                            * jcp.dimK_reg_block * typesize);
+        }
+///my : no change for W_SGD
+        mov(ireg_nb_tile_block_ur, ptr[param1 + GET_OFF(nb_tile_block_ur)]);
+        imul(ireg_nb_tile_block_ur, ireg_nb_tile_block_ur,
+                jcp.dimK_nb_block * jcp.dimK_block * jcp.dimNregBlockRemain
+                        * jcp.dimK_reg_block * typesize);
+
+        mov(ireg_tile_block_ur, ptr[param1 + GET_OFF(tile_block_ur)]);
+        imul(ireg_tile_block_ur, ireg_tile_block_ur,
+                jcp.dimK_reg_block * typesize);
+
+        add(ireg_output, ireg_nb_tile_block_ur);
+        add(ireg_output, ireg_tile_block_ur);
+        if (not_tiled) add(ireg_output, ireg_tile_block);
+
+        for (int j = 0; j < alpha; j++) {
+            for (int i = 0; i < alpha; i++) {
+                vmovups(zmm_temp,
+                        ptr[ireg_Iw
+                                + (j * alpha * simd_w + i * simd_w)
+                                        * typesize]);
+///my : no change for W_SGD
+                int j_base_offset = j * alpha * jcp.dimNblockRemain
+                        * jcp.dimK_nb_block * jcp.dimK_block
+                        * jcp.dimNregBlockRemain * jcp.dimK_reg_block * typesize;
+                int i_base_offset = i * jcp.dimNblockRemain * jcp.dimK_nb_block
+                        * jcp.dimK_block * jcp.dimNregBlockRemain
                         * jcp.dimK_reg_block * typesize;
 
                 if (not_tiled && streamout)
@@ -1027,13 +2032,223 @@ void _jit_avx512_core_f32_wino_conv_4x3_data_kernel ::
                         ptr[ireg_I
                                 + (idx * alpha * simd_w + i * simd_w)
                                         * typesize]);
-                int j_base_offset = i * alpha * jcp.dimN_block
-                        * jcp.dimK_nb_block * jcp.dimK_block
-                        * jcp.dimN_reg_block * jcp.dimK_reg_block * typesize;
-                int idx_base_offset = idx * jcp.dimN_block * jcp.dimK_nb_block
-                        * jcp.dimK_block * jcp.dimN_reg_block
-                        * jcp.dimK_reg_block * typesize;
-                prefetcht0(ptr[ireg_output + j_base_offset + idx_base_offset]);
+            }
+
+            fma4(zmm_t(0), zmm_I(2), zmm_G(0), zmm_I(4));
+            fma4(zmm_t(1), zmm_I(1), zmm_G(0), zmm_I(3));
+            fma4(zmm_t(2), zmm_I(2), zmm_G(1), zmm_I(4));
+            fma4(zmm_t(3), zmm_I(1), zmm_G(1), zmm_I(3));
+            fma4(zmm_t(4), zmm_I(0), zmm_G(2), zmm_I(4));
+            fma4(zmm_t(5), zmm_I(1), zmm_G(2), zmm_I(5));
+
+            fma4(zmm_T(0), zmm_I(2), zmm_G(3), zmm_t(4));
+            fma4(zmm_T(1), zmm_t(1), zmm_G(4), zmm_t(0));
+            fma4(zmm_T(2), zmm_t(1), zmm_G(5), zmm_t(0));
+            fma4(zmm_T(3), zmm_t(3), zmm_G(6), zmm_t(2));
+            fma4(zmm_T(4), zmm_t(3), zmm_G(7), zmm_t(2));
+            fma4(zmm_T(5), zmm_I(3), zmm_G(8), zmm_t(5));
+
+            for (int idx = 0; idx < alpha; idx++) {
+                vmovups(ptr[ireg_T
+                                + (idx * alpha * simd_w + i * simd_w)
+                                        * typesize],
+                        zmm_T(idx));
+            }
+        }
+        for (int i = 0; i < alpha; i++) {
+            for (int idx = 0; idx < alpha; idx++) {
+                vmovups(zmm_T(idx),
+                        ptr[ireg_T
+                                + (i * alpha * simd_w + idx * simd_w)
+                                        * typesize]);
+            }
+
+            fma4(zmm_t(0), zmm_T(2), zmm_G(0), zmm_T(4));
+            fma4(zmm_t(1), zmm_T(1), zmm_G(0), zmm_T(3));
+            fma4(zmm_t(2), zmm_T(2), zmm_G(1), zmm_T(4));
+            fma4(zmm_t(3), zmm_T(1), zmm_G(1), zmm_T(3));
+            fma4(zmm_t(4), zmm_T(0), zmm_G(2), zmm_T(4));
+            fma4(zmm_t(5), zmm_T(1), zmm_G(2), zmm_T(5));
+
+            fma4(zmm_I(0), zmm_T(2), zmm_G(3), zmm_t(4));
+            fma4(zmm_I(1), zmm_t(1), zmm_G(4), zmm_t(0));
+            fma4(zmm_I(2), zmm_t(1), zmm_G(5), zmm_t(0));
+            fma4(zmm_I(3), zmm_t(3), zmm_G(6), zmm_t(2));
+            fma4(zmm_I(4), zmm_t(3), zmm_G(7), zmm_t(2));
+            fma4(zmm_I(5), zmm_T(3), zmm_G(8), zmm_t(5));
+
+            for (int idx = 0; idx < alpha; idx++) {
+                vmovups(ptr[ireg_Iw
+                                + (i * alpha * simd_w + idx * simd_w)
+                                        * typesize],
+                        zmm_I(idx));
+            }
+        }
+    };
+
+    auto inner_loops = [=]() {
+        init_G();
+        load_src();
+        trans_I_4x4_3x3();
+        store_Iw();
+    };
+
+    preamble();
+    inner_loops();
+    postamble();
+}
+
+///my : new cache block method
+void _jit_avx512_core_f32_wino_conv_4x3_data_kernel ::
+        input_transform_data_foot_ker_generate() {
+    bool is_fwd = one_of(
+            jcp.prop_kind, dnnl_forward_training, dnnl_forward_inference);
+    int inpw = is_fwd ? jcp.iw : jcp.ow;
+    int inph = is_fwd ? jcp.ih : jcp.oh;
+    int l_pad = is_fwd ? jcp.l_pad : jcp.iw + jcp.r_pad - jcp.ow;
+    int t_pad = is_fwd ? jcp.t_pad : jcp.ih + jcp.t_pad - jcp.oh;
+    int wp_max = inpw + l_pad;
+    int hp_max = inph + t_pad;
+    bool not_tiled = jcp.sched_policy == WSCHED_DATA_W_S_G_D;
+    int G_size = 9;
+
+    auto zmm_zero = Xbyak::Zmm(0);
+    auto zmm_temp = Xbyak::Zmm(31);
+    auto zmm_G = [=](int i) { return Xbyak::Zmm(1 + i); };
+    auto zmm_I = [=](int i) { return Xbyak::Zmm(1 + G_size + i); };
+    auto zmm_T = [=](int i) { return Xbyak::Zmm(1 + G_size + alpha + i); };
+    auto zmm_t = [=](int i) { return Xbyak::Zmm(1 + G_size + 2 * alpha + i); };
+
+    auto init_G = [=]() {
+        mov(ireg_temp, ptr[param1 + GET_OFF(G)]);
+        for (int i = 0; i < G_size; i++) {
+            vbroadcastss(zmm_G(i), ptr[ireg_temp + i * typesize]);
+        }
+    };
+
+    auto load_src = [=]() {
+        mov(ireg_src, ptr[param1 + GET_OFF(src)]); // base addr of inp
+        mov(ireg_I, ptr[param1 + GET_OFF(M)]);
+
+        xor_(ireg_zero, ireg_zero);
+        vpxord(zmm_zero, zmm_zero, zmm_zero);
+
+        mov(ireg_ydim, ptr[param1 + GET_OFF(tj)]);
+        shl(ireg_ydim, 2); // tj * tile_size (==4)
+        mov(ireg_xdim, ptr[param1 + GET_OFF(ti)]);
+        shl(ireg_xdim, 2); // ti * tilesize (==4)
+
+        for (int j = 0; j < alpha; j++) {
+            mov(ireg_temp, ireg_ydim);
+            add(ireg_temp, j);
+
+            mov(ireg_mask_j, 0xffff);
+            cmp(ireg_temp, t_pad);
+            cmovl(ireg_mask_j, ireg_zero);
+            cmp(ireg_temp, hp_max);
+            cmovge(ireg_mask_j, ireg_zero);
+
+            sub(ireg_temp, t_pad);
+            imul(ireg_temp, ireg_temp, inpw * simd_w * typesize);
+            mov(ireg_inp_j, ireg_src);
+            add(ireg_inp_j, ireg_temp);
+
+            for (int i = 0; i < alpha; i++) {
+
+                mov(ireg_temp, ireg_xdim);
+                add(ireg_temp, i);
+
+                mov(ireg_mask, 0xffff);
+                cmp(ireg_temp, l_pad);
+                cmovl(ireg_mask, ireg_zero);
+                cmp(ireg_temp, wp_max);
+                cmovge(ireg_mask, ireg_zero);
+                and_(ireg_mask, ireg_mask_j);
+
+                sub(ireg_temp, l_pad);
+                shl(ireg_temp, 4 + 2);
+
+                vpxord(zmm_temp, zmm_temp, zmm_temp);
+                Opmask kmask = Opmask(7);
+                kmovw(kmask, ireg_mask_32);
+                vmovups(zmm_temp | kmask, ptr[ireg_inp_j + ireg_temp]);
+                vmovups(ptr[ireg_I
+                                + (j * alpha * simd_w + i * simd_w) * typesize],
+                        zmm_temp);
+            }
+        }
+    };
+///my : new register block method
+///change all dimN_block and dimN_reg_block to dimNblockRemain and dimNregBlockRemain
+    auto store_Iw = [=]() {
+        mov(ireg_Iw, ptr[param1 + GET_OFF(Mw)]);
+        mov(ireg_output, ptr[param1 + GET_OFF(dst)]);
+
+        bool streamout = jcp.dimN * jcp.dimK * alpha * alpha * sizeof(float)
+                        > 2 * LLC_data_size
+                ? true
+                : false;
+
+        if (not_tiled) {///except this block for correct offset
+            mov(ireg_tile_block, ptr[param1 + GET_OFF(tile_block)]);
+            imul(ireg_tile_block, ireg_tile_block,
+                    alpha * alpha * jcp.dimN_block * jcp.dimK_nb_block
+                            * jcp.dimK_block * jcp.dimN_reg_block
+                            * jcp.dimK_reg_block * typesize);
+        }
+
+///my : new data layout for input buffer
+mov(ireg_nb_tile_block_ur, ptr[param1 + GET_OFF(nb_tile_block_ur)]);
+imul(ireg_nb_tile_block_ur, ireg_nb_tile_block_ur,
+        jcp.dimNregBlockRemain * jcp.dimK_reg_block * typesize);
+
+        mov(ireg_tile_block_ur, ptr[param1 + GET_OFF(tile_block_ur)]);
+        imul(ireg_tile_block_ur, ireg_tile_block_ur,
+                jcp.dimK_reg_block * typesize);
+
+        add(ireg_output, ireg_nb_tile_block_ur);
+        add(ireg_output, ireg_tile_block_ur);
+        if (not_tiled) add(ireg_output, ireg_tile_block);
+
+        for (int j = 0; j < alpha; j++) {
+            for (int i = 0; i < alpha; i++) {
+                vmovups(zmm_temp,
+                        ptr[ireg_Iw
+                                + (j * alpha * simd_w + i * simd_w)
+                                        * typesize]);
+
+int j_base_offset, i_base_offset;
+///my : new data layout for input buffer
+j_base_offset = j * alpha * jcp.dimNblockRemain * jcp.dimNregBlockRemain * jcp.dimK_reg_block * typesize;
+i_base_offset = i * jcp.dimNblockRemain * jcp.dimNregBlockRemain * jcp.dimK_reg_block * typesize;
+
+                if (not_tiled && streamout)
+                    vmovntps(ptr[ireg_output + j_base_offset + i_base_offset],
+                            zmm_temp);
+                else
+                    vmovups(ptr[ireg_output + j_base_offset + i_base_offset],
+                            zmm_temp);
+            }
+        }
+    };
+
+    auto fma4 = [=](Zmm dst, Zmm a, Zmm b, Zmm c) {
+        vmulps(zmm_temp, a, b);
+        vaddps(dst, zmm_temp, c);
+    };
+
+    auto trans_I_4x4_3x3 = [=]() {
+        mov(ireg_Iw, ptr[param1 + GET_OFF(Mw)]);
+        mov(ireg_T, ptr[param1 + GET_OFF(T)]);
+        mov(ireg_I, ptr[param1 + GET_OFF(M)]);
+
+        mov(ireg_output, ptr[param1 + GET_OFF(dst)]); // for prefetch
+        for (int i = 0; i < alpha; i++) {
+            for (int idx = 0; idx < alpha; idx++) {
+                vmovups(zmm_I(idx),
+                        ptr[ireg_I
+                                + (idx * alpha * simd_w + i * simd_w)
+                                        * typesize]);
             }
 
             fma4(zmm_t(0), zmm_I(2), zmm_G(0), zmm_I(4));
@@ -1184,6 +2399,26 @@ status_t _jit_avx512_core_f32_wino_conv_4x3_data_kernel::init_conf_common(
     return status::success;
 }
 
+///my : new register block method
+void set_kernel_dims_reg_block_fix(jit_conv_winograd_conf_t &jcp) {
+    /* ----------- dimM reg block ---------------------*/
+    auto test_cond_dimM_reg_block = [](jit_conv_winograd_conf_t &jcp,
+                                            int dimM_reg_block,
+                                            int current_best) {
+        int max_dimM_reg_block = jcp.kernel_kind == embd_bcast ? 1 : 4;
+        return (dimM_reg_block >= 1) && (dimM_reg_block <= max_dimM_reg_block)
+                && (dimM_reg_block > current_best);
+    };
+    jcp.dimM_reg_block = get_divisor_satisfying_cond(
+            jcp, jcp.dimM / jcp.dimM_simd_block, 1, test_cond_dimM_reg_block);
+
+    /* ----------- dimN reg block ---------------------*/
+
+    jcp.dimN_reg_block = 30;
+    jcp.dimNregBlockRemain = jcp.dimN % 30;
+    jcp.dimNblockRemain = jcp.dimNregBlockRemain != 0 ? 1 : 0;
+}
+
 void set_kernel_dims_reg_block(jit_conv_winograd_conf_t &jcp) {
 
     /* ----------- dimM reg block ---------------------*/
@@ -1212,6 +2447,16 @@ void set_kernel_dims_reg_block(jit_conv_winograd_conf_t &jcp) {
     };
     jcp.dimN_reg_block = get_divisor_satisfying_cond(
             jcp, jcp.dimN, 1, test_cond_dimN_reg_block);
+///my : new register block method
+    jcp.dimNregBlockRemain = 0;
+    jcp.dimNblockRemain = 0;
+///my : new cache block method
+if (jcp.kernel_kind == expl_bcast) {
+    jcp.dimM_reg_block = 4;///4*6+6=30
+    jcp.dimN_reg_block = 6;///this statement should be here or later in the 2004+ location? 
+                           ///may influence the dimK block
+}
+
 }
 
 status_t set_wsched_DATA_W_SGD_avx512_core(jit_conv_winograd_conf_t &jcp) {
@@ -1219,7 +2464,9 @@ status_t set_wsched_DATA_W_SGD_avx512_core(jit_conv_winograd_conf_t &jcp) {
 
     jcp.kernel_kind = embd_bcast;
 
-    set_kernel_dims_reg_block(jcp);
+    // set_kernel_dims_reg_block(jcp);
+///my : new register block method
+set_kernel_dims_reg_block_fix(jcp);
 
     /*-------------- L2 blocking for dimN block ---------*/
 
@@ -1234,13 +2481,15 @@ status_t set_wsched_DATA_W_SGD_avx512_core(jit_conv_winograd_conf_t &jcp) {
     jcp.dimN_block = get_divisor_satisfying_cond(
             jcp, jcp.dimN / jcp.dimN_reg_block, 1, test_cond_dimN_block);
     jcp.dimN_nb_block = jcp.dimN / jcp.dimN_block / jcp.dimN_reg_block;
+///my : new register block method
+if (jcp.dimNregBlockRemain != 0) jcp.dimN_nb_block += 1;///one more block for Nblock=1&NregBlockRemain
 
 printf("max thread: %d\n", dnnl_get_max_threads());
 printf("L1=%d, L2=%d, L3(shared)=%d\n", L1_cache_size, L2_cache_size, LLC_data_size);
-printf("dimN=%d, dimK=%d, dimM=%d\n", jcp.dimN, jcp.dimK, jcp.dimM);
 printf("get dimN_nb_block=%d, dimN_block=%d, dimN_reg_block=%d\n", jcp.dimN_nb_block, jcp.dimN_block, jcp.dimN_reg_block);
 
-    if (check_L2_block_per_thread(jcp, jcp.dimN_block, 0.1, 3.2)
+if (check_L2_block_for_W_SGD(jcp, jcp.dimN_block)///my : adjust strategy for W_SGD
+    // if (check_L2_block_per_thread(jcp, jcp.dimN_block, 0.1, 3.2)
             && (jcp.dimN_nb_block >= 1.5 * dnnl_get_max_threads())) {
 
         /* ------------------- L1 blocking for GEMM --------------*/
@@ -1255,7 +2504,8 @@ printf("get dimN_nb_block=%d, dimN_block=%d, dimN_reg_block=%d\n", jcp.dimN_nb_b
         jcp.dimK_block = get_divisor_satisfying_cond(
                 jcp, jcp.dimK / jcp.dimK_reg_block, 1, test_cond_dimK_block);
 
-        if (check_L1_block_gemm(jcp, jcp.dimK_block, 1, 0.1, 1.0)) {
+if (check_L1_block_gemm(jcp, jcp.dimK_block, 1, 0, 1.0)) {///my: here should no lower bound
+        // if (check_L1_block_gemm(jcp, jcp.dimK_block, 1, 0.1, 1.0)) {
             jcp.dimK_nb_block = jcp.dimK / jcp.dimK_block / jcp.dimK_reg_block;
 
             /* -------------- Choose dimM block -------------------*/
@@ -1335,31 +2585,46 @@ void set_kernel_blocking_DATA_W_S_G_D(jit_conv_winograd_conf_t &jcp) {
                 test_cond1_bis_dimM_block);
     jcp.dimM_nb_block = jcp.dimM
             / (jcp.dimM_simd_block * jcp.dimM_block * jcp.dimM_reg_block);
-
+///my : new cache block method
+if (jcp.kernel_kind == embd_bcast) {
     //******************* Choosing dimN_block *******************//
     auto test_cond2_dimN_block = [](jit_conv_winograd_conf_t &jcp,
                                          int dimN_block, int current_best) {
         return check_cond2(dimN_block, jcp.dimN_reg_block, jcp.dimK_nb_block,
                        jcp.dimK_block, jcp.dimK_reg_block, jcp.dimM_block,
-                       jcp.dimM_reg_block, jcp.dimM_simd_block, .9f)
+                       jcp.dimM_reg_block, jcp.dimM_simd_block, .45f)///.9f)
                 && (dimN_block > current_best);
     };
-
     jcp.dimN_block = get_divisor_satisfying_cond(
             jcp, jcp.dimN / jcp.dimN_reg_block, 1, test_cond2_dimN_block);
     jcp.dimN_nb_block = jcp.dimN / (jcp.dimN_reg_block * jcp.dimN_block);
+} else {
+    jcp.dimN_block = get_new_Nblock();///49;///autoblock: could be a searchable argument between 1 and L2cache-limit
+    jcp.dimN_nb_block = jcp.dimN / (jcp.dimN_reg_block * jcp.dimN_block);
+    auto test_cond_dimN_reg_block_Remain = [](jit_conv_winograd_conf_t &jcp,
+                                            int dimN_reg_block,
+                                            int current_best) {
+        return (dimN_reg_block >= 1) && (dimN_reg_block <= 6)
+                && (dimN_reg_block > current_best);
+    };
+    jcp.dimNregBlockRemain = get_divisor_satisfying_cond(
+            jcp, jcp.dimN % (jcp.dimN_reg_block * jcp.dimN_block), 1, test_cond_dimN_reg_block_Remain);
+    jcp.dimNblockRemain = jcp.dimN % (jcp.dimN_reg_block * jcp.dimN_block) / jcp.dimNregBlockRemain;
+    if (jcp.dimNblockRemain != 0) jcp.dimN_nb_block += 1;
+}
+
 }
 
 status_t set_wsched_DATA_W_S_G_D_avx512_core(jit_conv_winograd_conf_t &jcp) {
 
     jcp.kernel_kind = expl_bcast;
     set_kernel_blocking_DATA_W_S_G_D(jcp);
-    if (!(check_kernel_cond(jcp.dimM_block, jcp.dimM_reg_block,
-                jcp.dimM_simd_block, jcp.dimN_block, jcp.dimN_reg_block,
-                jcp.dimK, .1f, .35f))) {
-        jcp.kernel_kind = embd_bcast;
-        set_kernel_blocking_DATA_W_S_G_D(jcp);
-    }
+//    if (!(check_kernel_cond(jcp.dimM_block, jcp.dimM_reg_block,
+//                jcp.dimM_simd_block, jcp.dimN_block, jcp.dimN_reg_block,
+//                jcp.dimK, .1f, .35f))) {
+//        jcp.kernel_kind = embd_bcast;
+//        set_kernel_blocking_DATA_W_S_G_D(jcp);
+//    }
     jcp.sched_policy = WSCHED_DATA_W_S_G_D;
     return status::success;
 }
@@ -1453,6 +2718,7 @@ else
 printf("MnbBlock=%d, MBlock=%d, MregBlock=%d, MsimdBlock=%d\n", jcp.nb_oc, jcp.oc_block, jcp.oc_reg_block, jcp.oc_simd_block);
 printf("KnbBlock=%d, KBlock=%d, (KregBlock)KsimdBlock=%d\n", jcp.nb_ic, jcp.ic_block, jcp.ic_simd_block);
 printf("NnbBlock=%d, NBlock=%d, NregBlock=%d\n", jcp.tile_block, jcp.nb_tile_block_ur, jcp.tile_block_ur);
+printf("NregBlockRemain=%d, NblockRemain=%d\n", jcp.dimNregBlockRemain, jcp.dimNblockRemain);
 
     /* re-create weights primitive descriptor
     and set weights wino_blocking */

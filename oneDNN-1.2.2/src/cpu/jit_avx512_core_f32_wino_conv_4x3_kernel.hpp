@@ -56,6 +56,46 @@ struct _jit_avx512_core_f32_wino_conv_4x3_data_kernel : public jit_generator {
             this->gemm_loop_generate();
             gemm_loop_ker = (decltype(gemm_loop_ker))addr;
         }
+///my : new register block method
+{
+    align();
+    const Xbyak::uint8 *addr = getCurr();
+    this->input_transform_data_tail_ker_generate();
+    input_transform_data_tail_ker = (decltype(input_transform_data_tail_ker))addr;
+}
+{
+    align();
+    const Xbyak::uint8 *addr = getCurr();
+    this->output_transform_data_tail_ker_generate();
+    output_transform_data_tail_ker
+            = (decltype(output_transform_data_tail_ker))addr;
+}
+{
+    align();
+    const Xbyak::uint8 *addr = getCurr();
+    this->gemm_loop_tail_generate();
+    gemm_loop_tail_ker = (decltype(gemm_loop_tail_ker))addr;
+}
+///my : new cache block method
+{
+    align();
+    const Xbyak::uint8 *addr = getCurr();
+    this->input_transform_data_foot_ker_generate();
+    input_transform_data_foot_ker = (decltype(input_transform_data_foot_ker))addr;
+}
+{
+    align();
+    const Xbyak::uint8 *addr = getCurr();
+    this->output_transform_data_foot_ker_generate();
+    output_transform_data_foot_ker
+            = (decltype(output_transform_data_foot_ker))addr;
+}
+{
+    align();
+    const Xbyak::uint8 *addr = getCurr();
+    this->gemm_loop_foot_generate();
+    gemm_loop_foot_ker = (decltype(gemm_loop_foot_ker))addr;
+}
     }
 
     DECLARE_CPU_JIT_AUX_FUNCTIONS(
@@ -74,7 +114,14 @@ struct _jit_avx512_core_f32_wino_conv_4x3_data_kernel : public jit_generator {
     void (*input_transform_data_ker)(jit_wino_transform_call_s *);
     void (*output_transform_data_ker)(jit_wino_transform_call_s *);
     void (*weights_transform_data_ker)(jit_wino_transform_call_s *);
-
+///my : new register block method
+void (*gemm_loop_tail_ker)(float *, const float *, const float *, const int);
+void (*input_transform_data_tail_ker)(jit_wino_transform_call_s *);
+void (*output_transform_data_tail_ker)(jit_wino_transform_call_s *);
+///my : new cache block method
+void (*gemm_loop_foot_ker)(float *, const float *, const float *, const int);
+void (*input_transform_data_foot_ker)(jit_wino_transform_call_s *);
+void (*output_transform_data_foot_ker)(jit_wino_transform_call_s *);
 protected:
     using reg64_t = const Xbyak::Reg64;
     using reg32_t = const Xbyak::Reg32;
@@ -84,6 +131,14 @@ protected:
     void input_transform_data_ker_generate();
     void output_transform_data_ker_generate();
     void weights_transform_data_ker_generate();
+///my : new register block method
+void gemm_loop_tail_generate();
+void input_transform_data_tail_ker_generate();
+void output_transform_data_tail_ker_generate();
+///my : new cache block method
+void gemm_loop_foot_generate();
+void input_transform_data_foot_ker_generate();
+void output_transform_data_foot_ker_generate();
 
     /* registers used for GEMM */
     reg64_t reg_dstC = abi_param1;
