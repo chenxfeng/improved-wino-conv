@@ -10,3 +10,5 @@ Our experients were carried on two x86 servers. The first server equipped with a
 Generation Scalable Processors Gold6230N, and the second server is a dual-socket system which has two Gold6150 processors in its two sockets. Those servers run on Linux system(CentOS 7.6). 
 
 We organize codes with different purpose in different branches. The master-branch contain codes including all our three optimizaions, and the original-branch is the original DNNL codes with some information printed. 
+
+To run those experiments, the machine should build DNNL from source first. The detail can be refered [here](https://oneapi-src.github.io/oneDNN/dev_guide_build.html). And then one can compile the file with a command ``g++ test.cpp -ldnnl -std=c++11``. Usually manually specifying environment variables such as ``OMP_NUM_THREADS`` and ``OMP_PROC_BIND`` is necessary. 
