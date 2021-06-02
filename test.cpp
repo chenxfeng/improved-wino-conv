@@ -207,7 +207,7 @@ void performance_profiling(engine::kind engine_kind, int argc, char **argv) {
         for (size_t i = 0; i < OC*IC*KH*KW; ++i)
             data[i] = (float)i;//sinf((float)i);
         data = static_cast<float *>(conv_user_bia_m.get_data_handle());
-        for (size_t i = 0; i < conv_user_bia_m.get_desc().get_size(); ++i)
+        for (size_t i = 0; i < OC; ++i)
             data[i] = (float)i;//sinf((float)i);
 
         auto conv = convolution_forward(conv_pd);
