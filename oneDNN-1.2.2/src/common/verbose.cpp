@@ -69,6 +69,14 @@
 namespace dnnl {
 namespace impl {
 
+///my w_sgd_plus: choose best Nblock
+static setting_t<int> auto_n_block {1};
+int get_new_Nblock() {
+    int nblock = auto_n_block.get();
+    auto_n_block.set(nblock+1);
+    return nblock;
+}
+
 static setting_t<int> verbose {0};
 int get_verbose() {
 #if !defined(DISABLE_VERBOSE)

@@ -320,6 +320,9 @@ struct jit_conv_winograd_conf_t : public jit_conv_conf_t {
     int dimN_block;
     int dimN_nb_block;
 
+///myNewDesign : searching for Nblock and this is the remained
+int dimNblockRemained;
+
     winograd_sched_t sched_policy;
 };
 

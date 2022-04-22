@@ -109,6 +109,13 @@ protected:
     _jit_avx512_core_f32_wino_conv_4x3_data_kernel *kernel_;
     const primitive_attr_t *attr_;
 
+///myNewDesign : search for Nblock and deal with the remained
+void input_transform_tileblock_data_tail(int tile_block,
+        const jit_conv_winograd_conf_t &jcp, float *inp, float *tinp) const;
+void output_transform_tileblock_data_tail(int tile_block,
+        const jit_conv_winograd_conf_t &jcp, const post_ops_t &p_ops,
+        float *toutp, float *outp, float *bias) const;
+
 private:
     DNNL_DISALLOW_COPY_AND_ASSIGN(_jit_avx512_core_f32_wino_conv_4x3_t);
 };

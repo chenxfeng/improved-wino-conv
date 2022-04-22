@@ -56,6 +56,13 @@ struct _jit_avx512_core_f32_wino_conv_4x3_data_kernel : public jit_generator {
             this->gemm_loop_generate();
             gemm_loop_ker = (decltype(gemm_loop_ker))addr;
         }
+///myNewDesign : search for Nblock and deal with the remained
+{
+    align();
+    const Xbyak::uint8 *addr = getCurr();
+    this->gemm_loop_tail_generate();
+    gemm_loop_tail_ker = (decltype(gemm_loop_tail_ker))addr;
+}
     }
 
     DECLARE_CPU_JIT_AUX_FUNCTIONS(
@@ -75,6 +82,9 @@ struct _jit_avx512_core_f32_wino_conv_4x3_data_kernel : public jit_generator {
     void (*output_transform_data_ker)(jit_wino_transform_call_s *);
     void (*weights_transform_data_ker)(jit_wino_transform_call_s *);
 
+///myNewDesign : search for Nblock and deal with the remained
+void (*gemm_loop_tail_ker)(float *, const float *, const float *, const int);
+
 protected:
     using reg64_t = const Xbyak::Reg64;
     using reg32_t = const Xbyak::Reg32;
@@ -84,6 +94,8 @@ protected:
     void input_transform_data_ker_generate();
     void output_transform_data_ker_generate();
     void weights_transform_data_ker_generate();
+///myNewDesign : search for Nblock and deal with the remained
+void gemm_loop_tail_generate();
 
     /* registers used for GEMM */
     reg64_t reg_dstC = abi_param1;
@@ -93,6 +105,10 @@ protected:
 
     reg64_t reg_dimM_block_loop_cnt = r10;
     reg64_t reg_dimK_block_loop_cnt = r11;
+
+///add for temporal used
+reg64_t reg_temp = abi_not_param1;
+reg64_t reg_dimN_block_loop_cnt = r12;
 
     /* registers used for transforms*/
     reg64_t param = abi_param1;

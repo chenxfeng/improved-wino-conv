@@ -33,6 +33,10 @@ struct verbose_t {
     int level;
 };
 
+///my w_sgd_plus: autoblock: global access api
+#define MAX_NBLOCK 100
+int get_new_Nblock();
+
 int get_verbose();
 double get_msec();
 const char *get_isa_info();

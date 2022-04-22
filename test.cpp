@@ -103,20 +103,20 @@ const int ExecCount = 10;
 // const memory::dim IW = 56, KW = 3, OW = 56;
 
 ///VGG16 conv4_1
-// const memory::dims strides = {1, 1};
-// const memory::dims padding = {1, 1};
-// const memory::dim BATCH = 512;
-// const memory::dim IC = 256, OC = 512;
-// const memory::dim IH = 28, KH = 3, OH = 28;
-// const memory::dim IW = 28, KW = 3, OW = 28;
-
-///VGG16 conv4_2/3 expl 
 const memory::dims strides = {1, 1};
 const memory::dims padding = {1, 1};
 const memory::dim BATCH = 512;
-const memory::dim IC = 512, OC = 512;
+const memory::dim IC = 256, OC = 512;
 const memory::dim IH = 28, KH = 3, OH = 28;
 const memory::dim IW = 28, KW = 3, OW = 28;
+
+///VGG16 conv4_2/3 expl 
+// const memory::dims strides = {1, 1};
+// const memory::dims padding = {1, 1};
+// const memory::dim BATCH = 512;
+// const memory::dim IC = 512, OC = 512;
+// const memory::dim IH = 28, KH = 3, OH = 28;
+// const memory::dim IW = 28, KW = 3, OW = 28;
 
 ///VGG16 conv5_1/2/3
 // const memory::dims strides = {1, 1};
