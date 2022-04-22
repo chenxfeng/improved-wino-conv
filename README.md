@@ -12,3 +12,10 @@ The codes with different purpose are organized in different branches. The main-b
 
 To run those experiments, the machine should have DNNL built from source first. Briefly speaking, make a new directory ``build`` in the directory ``oneDNN``, and then run ``cmake ..`` in the directory ``build``. After that, DNNL can be built and installed with command ``make`` and ``sudo make install`` seperately. 
 More details can be refered [here](https://oneapi-src.github.io/oneDNN/dev_guide_build.html). And then one can compile the test files with a command ``g++ test.cpp -ldnnl -std=c++11``. Usually manually specifying environment variables such as ``OMP_NUM_THREADS`` and ``OMP_PROC_BIND`` is necessary at runtime. 
+
+# An Improved Winograd Convolution on NUMA system with multiple x86 CPUs
+
+> This software is the codes for our article "******". 
+> It is constructed based on [Intel DNNL](https://github.com/intel/mkl-dnn).
+
+We proposed a noval design for Winograd convolution to address the bottleneck problem caused by NUMA features on multi-CPU system. By designing a new computing pattern and three optimizations (i.e., new data layout, cache block searching and new matrix multiplication) based on the micro-architectural features of CPUs, we alleviate the memory bandwidth requirement and therefore improve the performance. The codes are in the branch multi-cpu. 
